@@ -1,0 +1,42 @@
+零声是使用的sh脚本；这里是自己手动配置的
+2026.1.30 结合Gemini，梳理了一下，并深入了解了page、cache相关的知识
+
+DPDK绑定相关：
+# Compile DPDK 会生成对应的驱动程序，一会需要挂载
+cd dpdk/
+# igb_uio is about 5% more efficient than vfio-pci, so continue using it.
+meson -Denable_kmods=true build
+ninja -C build
+ninja -C build install
+
+
+# Set hugepage (Linux only)
+# single-node system
+# 1024个2MB的page，让操作系统自己去分配
+echo 1024 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+
+# or NUMA (Linux only)
+# 如果有多CPU多内存条
+echo 1024 > /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages
+echo 1024 > /sys/devices/system/node/node1/hugepages/hugepages-2048kB/nr_hugepages
+
+
+# Using Hugepage with the DPDK (Linux only)
+#  这里是为了dpdk去分配和使用大页
+mkdir /mnt/huge
+mount -t hugetlbfs nodev /mnt/huge
+
+# Offload NIC
+#告诉内核我要准备搞驱动了，你提前准备好
+modprobe uio
+# 加载用户态的驱动，为了用户态直接操作硬件
+insmod /data/f-stack/dpdk/build/kernel/linux/igb_uio/igb_uio.ko
+# 查看状态
+dpdk-devbind.py --status
+ifconfig ens192 down
+./dpdk-devbind.py --bind=igb_uio ens192
+
+
+
+
+
