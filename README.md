@@ -99,7 +99,7 @@ ifconfig ens192 down
 
 ```bash
 # 1. 在回环网卡 (loopback) 上添加 VIP
-sudo ip addr add 192.168.72.160/32 dev lo
+sudo ip addr add 192.168.154.132/32 dev lo
 
 # 2. 禁止 RS 响应 VIP 的 ARP 请求（避免同网络下 ARP 冲突）
 sudo sysctl -w net.ipv4.conf.all.arp_ignore=1
@@ -118,7 +118,7 @@ ip addr show lo
 | 测试场景 | QPS (Req/Sec) | 平均延迟 (Avg Latency) |
 | :--- | :---: | :---: |
 | **不经过 L4 均衡器 (直连 RS)** | 131,716 | 12.34 ms |
-| **经过 L4 均衡器 (DR 模式)** | 126,051 | 13.00 ms |
+| **经过 L4 均衡器 (DR 模式)** | 120,051 | 12.54 ms |
 | **经过 L4 均衡器 (FULLNAT 模式)** | 108,635 | 13.05 ms |
 
 *(测试条件参考：`wrk -t4 -c2000 -d30s`，4 线程 2000 连接，压测时长 30 秒)*
