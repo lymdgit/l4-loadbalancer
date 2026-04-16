@@ -17,7 +17,6 @@
  * @author L4 Load Balancer Project
  */
 
-#include <atomic>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -60,10 +59,26 @@ static uint16_t g_port_id = 0; // 默认使用端口 0
 static struct rte_mempool *g_mbuf_pool = nullptr;
 static uint64_t g_tx_offloads_enabled = 0;
 
-// 统计信息 (使用 atomic 保证多核安全)
-static std::atomic<uint64_t> g_stats_rx{0};
-static std::atomic<uint64_t> g_stats_tx{0};
-static std::atomic<uint64_t> g_stats_dropped{0};
+// ============================================================================
+// Per-lcore 统计（替代全局 atomic，消除 cache line 竞争）
+//
+// 原来 g_stats_rx/tx/dropped 是全局 atomic，每次 rte_eth_rx_burst 后
+// 所有 lcore 争抢同一 cache line（即使用 relaxed，仍需总线协议）。
+//
+// 新方案：每个 lcore 只写自己的槽，统计线程聚合时才读所有槽。
+// alignas(RTE_CACHE_LINE_SIZE) 保证相邻槽不共享 cache line（false sharing）。
+// ============================================================================
+struct alignas(RTE_CACHE_LINE_SIZE) LcoreNicStats {
+    uint64_t rx      = 0;
+    uint64_t tx      = 0;
+    uint64_t dropped = 0;
+    // 3 × 8 = 24 字节，填充到 64（一个 cache line）
+    uint8_t  _pad[RTE_CACHE_LINE_SIZE - 3 * sizeof(uint64_t)];
+};
+static_assert(sizeof(LcoreNicStats) == RTE_CACHE_LINE_SIZE,
+              "LcoreNicStats must be exactly one cache line");
+
+static LcoreNicStats g_nic_stats[RTE_MAX_LCORE];
 
 // 多队列配置
 static uint16_t g_num_queues = 1;
@@ -91,12 +106,14 @@ static inline void tx_buffer_flush(TxBuffer *buf, uint16_t port,
     return;
 
   uint16_t nb_tx = rte_eth_tx_burst(port, queue, buf->pkts, buf->count);
-  // 原子变量，统计发出去多少包
-  g_stats_tx += nb_tx;
 
-  // 释放未发送的包：未能成功发送的包，直接释放掉
+  // Per-lcore 统计，无需原子操作
+  unsigned lid = rte_lcore_id();
+  if (lid >= RTE_MAX_LCORE) lid = 0;
+  g_nic_stats[lid].tx += nb_tx;
+
   if (unlikely(nb_tx < buf->count)) {
-    g_stats_dropped += (buf->count - nb_tx);
+    g_nic_stats[lid].dropped += (buf->count - nb_tx);
     for (uint16_t i = nb_tx; i < buf->count; ++i) {
       rte_pktmbuf_free(buf->pkts[i]);
     }
@@ -272,9 +289,6 @@ static inline struct rte_mbuf *process_packet_batch(struct rte_mbuf *mbuf) {
   } else {
     // 不发送，释放 mbuf
     rte_pktmbuf_free(mbuf);
-    if (!handled) {
-      ++g_stats_dropped;
-    }
     return nullptr; // 不需要发送
   }
 }
@@ -307,8 +321,8 @@ static int worker_loop(void *arg) {
     uint16_t nb_rx = rte_eth_rx_burst(g_port_id, queue_id, bufs, BURST_SIZE);
 
     if (nb_rx > 0) {
-      // 原子变量：统计接收到的总包数
-      g_stats_rx += nb_rx;
+      // Per-lcore 统计，无原子操作
+      g_nic_stats[lcore_id].rx += nb_rx;
 
       // 批量处理每个数据包
       for (uint16_t i = 0; i < nb_rx; ++i) {
@@ -354,10 +368,18 @@ static int worker_loop(void *arg) {
         auto stats = g_lb.get_stats();
         auto sess_stats = SessionManager::instance().get_stats();
         auto sess_dbg = SessionManager::instance().get_debug_stats();
+        // 聚合所有 lcore 的 NIC 统计（仅控制面，不在热路径）
+        uint64_t total_rx = 0, total_tx = 0, total_dropped = 0;
+        for (unsigned i = 0; i < RTE_MAX_LCORE; ++i) {
+            total_rx      += g_nic_stats[i].rx;
+            total_tx      += g_nic_stats[i].tx;
+            total_dropped += g_nic_stats[i].dropped;
+        }
+
         LOG_INFO("=== L4 LB Statistics (RSS: %u queues, Batch TX) ===",
                  g_num_queues);
-        LOG_INFO("DPDK RX: %lu, TX: %lu, Dropped: %lu", g_stats_rx.load(),
-                 g_stats_tx.load(), g_stats_dropped.load());
+        LOG_INFO("DPDK RX: %lu, TX: %lu, Dropped: %lu",
+                 total_rx, total_tx, total_dropped);
         LOG_INFO("LB RX: %lu, TX: %lu, Dropped: %lu", stats.rx_packets,
                  stats.tx_packets, stats.dropped_packets);
         LOG_INFO("ARP: %lu, ICMP: %lu, TCP: %lu, UDP: %lu", stats.arp_packets,
@@ -580,7 +602,14 @@ int main(int argc, char *argv[]) {
   auto final_stats = g_lb.get_stats();
   auto final_sess = SessionManager::instance().get_stats();
   LOG_INFO("Final Statistics:");
-  LOG_INFO("  DPDK RX: %lu, TX: %lu", g_stats_rx.load(), g_stats_tx.load());
+  uint64_t final_rx = 0, final_tx = 0, final_dropped = 0;
+  for (unsigned i = 0; i < RTE_MAX_LCORE; ++i) {
+      final_rx      += g_nic_stats[i].rx;
+      final_tx      += g_nic_stats[i].tx;
+      final_dropped += g_nic_stats[i].dropped;
+  }
+  LOG_INFO("  DPDK RX: %lu, TX: %lu, Dropped: %lu",
+           final_rx, final_tx, final_dropped);
   LOG_INFO("  LB Forwarded: %lu", final_stats.forwarded_packets);
   LOG_INFO("  Total Sessions: %lu", final_sess.total_sessions);
   LOG_INFO("========================================================");

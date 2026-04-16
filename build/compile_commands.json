@@ -1,7 +1,7 @@
 [
 {
-  "directory": "/home/lym/Desktop/l4-loadbalancer_v2/build",
-  "command": "/usr/bin/c++  -DALLOW_EXPERIMENTAL_API -D_GNU_SOURCE -I/home/lym/Desktop/l4-loadbalancer_v2/include -I/data/f-stack/dpdk/include    -Wall -Wextra -O2 -march=native -g -std=gnu++17 -o CMakeFiles/l4lb.dir/src/main.cpp.o -c /home/lym/Desktop/l4-loadbalancer_v2/src/main.cpp",
-  "file": "/home/lym/Desktop/l4-loadbalancer_v2/src/main.cpp"
+  "directory": "/home/lym/Desktop/l4-loadbalancer_v3/build",
+  "command": "/usr/bin/c++  -DALLOW_EXPERIMENTAL_API -DL4LB_HW_CKSUM -D_GNU_SOURCE -I/home/lym/Desktop/l4-loadbalancer_v3/include -I/data/f-stack/dpdk/include    -Wall -Wextra -O3 -march=native -g -fno-omit-frame-pointer -std=gnu++17 -o CMakeFiles/l4lb.dir/src/main.cpp.o -c /home/lym/Desktop/l4-loadbalancer_v3/src/main.cpp",
+  "file": "/home/lym/Desktop/l4-loadbalancer_v3/src/main.cpp"
 }
 ]

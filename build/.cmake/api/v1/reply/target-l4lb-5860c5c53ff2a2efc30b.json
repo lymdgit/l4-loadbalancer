@@ -1,0 +1,292 @@
+{
+	"artifacts" : 
+	[
+		{
+			"path" : "l4lb"
+		}
+	],
+	"backtrace" : 1,
+	"backtraceGraph" : 
+	{
+		"commands" : 
+		[
+			"add_executable",
+			"install",
+			"add_compile_options",
+			"add_definitions",
+			"include_directories"
+		],
+		"files" : 
+		[
+			"CMakeLists.txt"
+		],
+		"nodes" : 
+		[
+			{
+				"file" : 0
+			},
+			{
+				"command" : 0,
+				"file" : 0,
+				"line" : 92,
+				"parent" : 0
+			},
+			{
+				"command" : 1,
+				"file" : 0,
+				"line" : 184,
+				"parent" : 0
+			},
+			{
+				"command" : 2,
+				"file" : 0,
+				"line" : 44,
+				"parent" : 0
+			},
+			{
+				"command" : 3,
+				"file" : 0,
+				"line" : 54,
+				"parent" : 0
+			},
+			{
+				"command" : 4,
+				"file" : 0,
+				"line" : 63,
+				"parent" : 0
+			},
+			{
+				"command" : 4,
+				"file" : 0,
+				"line" : 68,
+				"parent" : 0
+			}
+		]
+	},
+	"compileGroups" : 
+	[
+		{
+			"compileCommandFragments" : 
+			[
+				{
+					"fragment" : " "
+				},
+				{
+					"backtrace" : 3,
+					"fragment" : "-Wall"
+				},
+				{
+					"backtrace" : 3,
+					"fragment" : "-Wextra"
+				},
+				{
+					"backtrace" : 3,
+					"fragment" : "-O3"
+				},
+				{
+					"backtrace" : 3,
+					"fragment" : "-march=native"
+				},
+				{
+					"backtrace" : 3,
+					"fragment" : "-g"
+				},
+				{
+					"backtrace" : 3,
+					"fragment" : "-fno-omit-frame-pointer"
+				},
+				{
+					"fragment" : "-std=gnu++17"
+				}
+			],
+			"defines" : 
+			[
+				{
+					"backtrace" : 4,
+					"define" : "ALLOW_EXPERIMENTAL_API"
+				},
+				{
+					"backtrace" : 4,
+					"define" : "L4LB_HW_CKSUM"
+				},
+				{
+					"backtrace" : 4,
+					"define" : "_GNU_SOURCE"
+				}
+			],
+			"includes" : 
+			[
+				{
+					"backtrace" : 5,
+					"path" : "/home/lym/Desktop/l4-loadbalancer_v3/include"
+				},
+				{
+					"backtrace" : 6,
+					"path" : "/data/f-stack/dpdk/include"
+				}
+			],
+			"language" : "CXX",
+			"sourceIndexes" : 
+			[
+				0
+			]
+		}
+	],
+	"id" : "l4lb::@6890427a1f51a3e7e1df",
+	"install" : 
+	{
+		"destinations" : 
+		[
+			{
+				"backtrace" : 2,
+				"path" : "bin"
+			}
+		],
+		"prefix" : 
+		{
+			"path" : "/usr/local"
+		}
+	},
+	"link" : 
+	{
+		"commandFragments" : 
+		[
+			{
+				"fragment" : "",
+				"role" : "flags"
+			},
+			{
+				"fragment" : "-Wl,--whole-archive",
+				"role" : "libraries"
+			},
+			{
+				"fragment" : "-lrte_eal",
+				"role" : "libraries"
+			},
+			{
+				"fragment" : "-lrte_log",
+				"role" : "libraries"
+			},
+			{
+				"fragment" : "-lrte_mempool",
+				"role" : "libraries"
+			},
+			{
+				"fragment" : "-lrte_mempool_ring",
+				"role" : "libraries"
+			},
+			{
+				"fragment" : "-lrte_ring",
+				"role" : "libraries"
+			},
+			{
+				"fragment" : "-lrte_mbuf",
+				"role" : "libraries"
+			},
+			{
+				"fragment" : "-lrte_ethdev",
+				"role" : "libraries"
+			},
+			{
+				"fragment" : "-lrte_net",
+				"role" : "libraries"
+			},
+			{
+				"fragment" : "-lrte_kvargs",
+				"role" : "libraries"
+			},
+			{
+				"fragment" : "-lrte_hash",
+				"role" : "libraries"
+			},
+			{
+				"fragment" : "-lrte_rcu",
+				"role" : "libraries"
+			},
+			{
+				"fragment" : "-lrte_timer",
+				"role" : "libraries"
+			},
+			{
+				"fragment" : "-lrte_cmdline",
+				"role" : "libraries"
+			},
+			{
+				"fragment" : "-lrte_telemetry",
+				"role" : "libraries"
+			},
+			{
+				"fragment" : "-lrte_pci",
+				"role" : "libraries"
+			},
+			{
+				"fragment" : "-lrte_bus_pci",
+				"role" : "libraries"
+			},
+			{
+				"fragment" : "-lrte_bus_vdev",
+				"role" : "libraries"
+			},
+			{
+				"fragment" : "-lrte_net_vmxnet3",
+				"role" : "libraries"
+			},
+			{
+				"fragment" : "-lrte_net_e1000",
+				"role" : "libraries"
+			},
+			{
+				"fragment" : "-lrte_net_virtio",
+				"role" : "libraries"
+			},
+			{
+				"fragment" : "-Wl,--no-whole-archive",
+				"role" : "libraries"
+			},
+			{
+				"fragment" : "-lpthread",
+				"role" : "libraries"
+			},
+			{
+				"fragment" : "-ldl",
+				"role" : "libraries"
+			},
+			{
+				"fragment" : "-lnuma",
+				"role" : "libraries"
+			},
+			{
+				"fragment" : "-lm",
+				"role" : "libraries"
+			}
+		],
+		"language" : "CXX"
+	},
+	"name" : "l4lb",
+	"nameOnDisk" : "l4lb",
+	"paths" : 
+	{
+		"build" : ".",
+		"source" : "."
+	},
+	"sourceGroups" : 
+	[
+		{
+			"name" : "Source Files",
+			"sourceIndexes" : 
+			[
+				0
+			]
+		}
+	],
+	"sources" : 
+	[
+		{
+			"backtrace" : 1,
+			"compileGroupIndex" : 0,
+			"path" : "src/main.cpp",
+			"sourceGroupIndex" : 0
+		}
+	],
+	"type" : "EXECUTABLE"
+}

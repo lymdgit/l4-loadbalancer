@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,20 +12,27 @@
 #include <unistd.h>
 
 #define PORT 80
-#define MAX_EVENTS 1024
+#define MAX_EVENTS 4096
 #define NUM_THREADS 4 // 根据 CPU 核心数调整
 
-static volatile unsigned long long total_requests = 0;
+// 每个线程一个 cache line（64字节对齐），避免 false sharing
+typedef struct {
+  unsigned long long count;
+  char _pad[56]; // 64 - sizeof(unsigned long long)
+} __attribute__((aligned(64))) per_thread_counter_t;
+
+static per_thread_counter_t thread_counters[16]; // 最多支持 16 线程
 
 void *stats_thread(void *arg) {
   (void)arg;
-  unsigned long long last_requests = 0;
+  unsigned long long last_total = 0;
   while (1) {
     sleep(1);
-    unsigned long long current_requests = total_requests;
-    printf("[STATS] Total Requests: %llu, QPS: %llu\n", current_requests,
-           current_requests - last_requests);
-    last_requests = current_requests;
+    unsigned long long total = 0;
+    for (int i = 0; i < NUM_THREADS; i++)
+      total += thread_counters[i].count;
+    printf("[STATS] Total Requests: %llu, QPS: %llu\n", total, total - last_total);
+    last_total = total;
   }
   return NULL;
 }
@@ -84,19 +92,20 @@ void *worker_thread(void *arg) {
           if (client_fd < 0)
             break;
           set_nonblock(client_fd);
-          // LT 模式：安全可靠，不需要 drain 循环
+          // 禁用 Nagle 算法，避免小响应与客户端 delayed ACK (40ms) 产生死锁
+          int nodelay = 1;
+          setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+          // LT 模式：有数据就会持续通知，recv 一次即可
           ev.events = EPOLLIN;
           ev.data.fd = client_fd;
           epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &ev);
         }
       } else {
-        // 使用 LT 模式，recv 一次即可，未读完的数据下次 epoll 会再通知
+        // LT 模式：单次 recv 即可，未读完的数据 epoll 下次继续通知
+        // 对于 wrk 一问一答模式，每次事件恰好对应一个完整请求，无需 drain 循环
         char buffer[4096];
         int len = recv(fd, buffer, sizeof(buffer), 0);
         if (len > 0) {
-          // wrk 使用 keep-alive 管线化，一次 recv 可能读到多个 HTTP 请求
-          // 必须数清楚有几个请求（按 \r\n\r\n 结尾计数），发对应数量的响应
-          // 否则请求/响应管线错位 → 连接永久卡死
           int num_requests = 0;
           for (int j = 0; j <= len - 4; j++) {
             if (buffer[j] == '\r' && buffer[j + 1] == '\n' &&
@@ -104,21 +113,26 @@ void *worker_thread(void *arg) {
               num_requests++;
             }
           }
+          // 收到了 partial request，等待下次 epoll 通知
           if (num_requests == 0)
-            num_requests = 1;
+            goto next_event;
 
           for (int r = 0; r < num_requests; r++) {
-            int sent = send(fd, response, response_len, MSG_NOSIGNAL);
-            if (sent <= 0) {
-              // send buffer 满或连接断开，关闭连接避免僵死
-              close(fd);
-              goto next_event;
+            int total_sent = 0;
+            while (total_sent < response_len) {
+              int sent = send(fd, response + total_sent,
+                              response_len - total_sent, MSG_NOSIGNAL);
+              if (sent <= 0) {
+                close(fd);
+                goto next_event;
+              }
+              total_sent += sent;
             }
           }
-          __sync_fetch_and_add(&total_requests, num_requests);
+          thread_counters[thread_id].count += num_requests;
         } else if (len == 0) {
           close(fd);
-        } else if (errno != EAGAIN) {
+        } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
           close(fd);
         }
       }

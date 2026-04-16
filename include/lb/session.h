@@ -2,19 +2,31 @@
  * @file session.h
  * @brief Session manager - per-lcore tables with rte_hash reverse table.
  *
- * 反向会话表使用 DPDK rte_hash 实现：
- * - 零动态内存分配（Mempool/rte_malloc 预分配）
- * - Lock-free 读路径（RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY_LF）
- * - SIMD 加速批量 Key 比对 + 紧凑连续内存布局
+ * 无锁化优化（相比原版本）：
+ *
+ * 1. 调试计数器全部 atomic → per-lcore 本地累加
+ *    原来 7 个 std::atomic<uint64_t>，热路径每次 fetch_add 都争抢同一
+ *    cache line（即使用 relaxed 语序，CAS 仍需总线锁定）。
+ *    改为 per-lcore LocalCounters（alignas 128B），每核独立累加，
+ *    get_debug_stats() 仅在控制面聚合。
+ *
+ * 2. active_sessions_ / total_sessions_ atomic → per-lcore
+ *    同样的 false sharing 问题，改为 per-lcore 累加后聚合。
+ *
+ * 3. next_nat_port_ atomic → per-lcore 端口分区，彻底消除 TOCTOU 竞争
+ *    原来所有 lcore 竞争同一个原子计数器，并且存在：
+ *      rte_hash_lookup → ... → rte_hash_add_key 之间的 TOCTOU 竞争
+ *    改为：每个 lcore 分配独立的端口范围，端口计数器只被单个 lcore 访问，
+ *    既消除 TOCTOU，也消除端口计数的 atomic 开销。
+ *
+ * 4. 保留：正向会话表 per-lcore（原已实现，无跨核访问）
+ * 5. 保留：反向会话表 rte_hash + RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY_LF
  */
 
 #ifndef L4LB_LB_SESSION_H
 #define L4LB_LB_SESSION_H
 
-#include "common/logger.h"
-#include "common/types.h"
 #include <array>
-#include <atomic>
 #include <unordered_map>
 
 #include <rte_byteorder.h>
@@ -23,330 +35,356 @@
 #include <rte_jhash.h>
 #include <rte_lcore.h>
 #include <rte_malloc.h>
-//  单例模式优点：
-//  实例放在静态存储区，生命周期由编译器控制，程序员不需要担心内存泄漏
-//  不用就不进行实例化，更加灵活
-//  全局访问很简单，SessionManager::instance()就可以获取到实例(引用)
-//  局部静态变量的初始化是线程安全的：多个核都抢着建立，C++会拦住所有并发，只让一个创建成功
+
+#include "common/logger.h"
+#include "common/types.h"
 
 namespace l4lb {
 
 struct SessionDebugStats {
-  uint64_t lookup_hit = 0;
-  uint64_t lookup_miss = 0;
-  uint64_t reverse_hit = 0;
-  uint64_t reverse_miss = 0;
-  uint64_t create = 0;
-  uint64_t update_miss = 0;
-  uint64_t cleanup_removed = 0;
+    uint64_t lookup_hit      = 0;
+    uint64_t lookup_miss     = 0;
+    uint64_t reverse_hit     = 0;
+    uint64_t reverse_miss    = 0;
+    uint64_t create          = 0;
+    uint64_t update_miss     = 0;
+    uint64_t cleanup_removed = 0;
 };
 
 class SessionManager {
 public:
-  static SessionManager &instance() {
-    // 当有多从instance时，这个函数会被多次调用，但是static变量只会被初始化一次
-    static SessionManager mgr;
-    // mgr就是引用，与指针不同的是，可以保证实例一定存在
-    // 而对于指针，有可能为nullptr。这是最大的不同
-    return mgr;
-  }
-
-  /**
-   * @brief 初始化反向哈希表（必须在 EAL 初始化之后调用）
-   *
-   * rte_hash 依赖 DPDK hugepage 内存，因此不能在构造函数中完成初始化，
-   * 必须在 rte_eal_init() 之后显式调用。
-   *
-   * @return true 初始化成功
-   */
-  bool init() {
-    // 创建 rte_hash：反向会话表
-    struct rte_hash_parameters params = {};
-    params.name = "reverse_session_hash";
-    params.entries = kReverseCapacity;
-    params.key_len = sizeof(FiveTuple);
-    params.hash_func = rte_jhash;
-    params.hash_func_init_val = 0;
-    params.socket_id = rte_socket_id();
-    // 开启 Lock-Free 读写并发模式
-    // 读路径完全无锁，写路径内部使用 CAS 原子操作
-    params.extra_flag = RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY_LF;
-
-    reverse_hash_ = rte_hash_create(&params);
-    if (!reverse_hash_) {
-      LOG_ERROR("Failed to create rte_hash for reverse session table: %s",
-                rte_strerror(rte_errno));
-      return false;
+    static SessionManager& instance() {
+        static SessionManager mgr;
+        return mgr;
     }
 
-    // 预分配 value 数组（rte_hash 只管 key 的存储和查找，value 由用户管理）
-    // 使用 rte_zmalloc 从 hugepage 分配，保证 cache line 对齐
-    reverse_data_ = static_cast<ReverseEntry *>(rte_zmalloc(
-        "reverse_data", sizeof(ReverseEntry) * kReverseCapacity,
-        RTE_CACHE_LINE_SIZE));
-    if (!reverse_data_) {
-      LOG_ERROR("Failed to allocate reverse data array");
-      rte_hash_free(reverse_hash_);
-      reverse_hash_ = nullptr;
-      return false;
-    }
+    bool init() {
+        struct rte_hash_parameters params = {};
+        params.name             = "reverse_session_hash";
+        params.entries          = kReverseCapacity;
+        params.key_len          = sizeof(FiveTuple);
+        params.hash_func        = rte_jhash;
+        params.hash_func_init_val = 0;
+        params.socket_id        = rte_socket_id();
+        // Lock-Free 读路径，写路径内部 CAS
+        params.extra_flag       = RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY_LF;
 
-    LOG_INFO("Reverse session hash table initialized: capacity=%u, "
-             "key_len=%zu, lock-free mode",
-             kReverseCapacity, sizeof(FiveTuple));
-    return true;
-  }
-
-  /**
-   * @brief 释放反向哈希表资源
-   */
-  void cleanup() {
-    if (reverse_hash_) {
-      rte_hash_free(reverse_hash_);
-      reverse_hash_ = nullptr;
-    }
-    if (reverse_data_) {
-      rte_free(reverse_data_);
-      reverse_data_ = nullptr;
-    }
-  }
-
-  void set_timeout(uint32_t seconds) {
-    timeout_sec_ = seconds;
-    timeout_tsc_ = rte_get_tsc_hz() * seconds;
-    touch_tsc_ = timeout_tsc_ / 4;
-    cleanup_interval_tsc_ = rte_get_tsc_hz(); // 1s
-  }
-
-  bool lookup(const FiveTuple &tuple, Session &session) {
-    auto &tbl = local_table();
-    auto it = tbl.sessions.find(tuple);
-    if (it == tbl.sessions.end()) {
-      lookup_miss_.fetch_add(1, std::memory_order_relaxed);
-      return false;
-    }
-    lookup_hit_.fetch_add(1, std::memory_order_relaxed);
-    uint64_t now_tsc = rte_get_tsc_cycles();
-    if (now_tsc - it->second.last_active > touch_tsc_) {
-      it->second.last_active = now_tsc;
-    }
-    session = it->second;
-    return true;
-  }
-
-  /**
-   * @brief 反向查找（Lock-Free 读路径）
-   *
-   * 使用 rte_hash_lookup 进行无锁查找，直接通过返回的数组下标
-   * 访问预分配的连续内存，无指针追逐、无锁、无 malloc。
-   */
-  bool lookup_reverse(const FiveTuple &reverse_tuple, Session &session) {
-    int32_t idx = rte_hash_lookup(reverse_hash_,
-                                   static_cast<const void *>(&reverse_tuple));
-    if (idx < 0) {
-      reverse_miss_.fetch_add(1, std::memory_order_relaxed);
-      return false;
-    }
-    // 直接数组下标访问，无锁、无指针追逐
-    session.client_tuple = reverse_data_[idx].client_tuple;
-    session.real_server_id = reverse_data_[idx].real_server_id;
-    reverse_hit_.fetch_add(1, std::memory_order_relaxed);
-    session.server_tuple = reverse_tuple;
-    return true;
-  }
-
-  Port create(const FiveTuple &client_tuple, uint32_t server_id,
-              IPv4Addr rs_ip = 0, Port rs_port = 0) {
-    uint64_t tsc = rte_get_tsc_cycles();
-    Session session;
-    session.client_tuple = client_tuple;
-    session.real_server_id = server_id;
-    session.nat_src_port = 0;
-    session.create_time = tsc;
-    session.last_active = tsc;
-    session.packets = 0;
-    session.bytes = 0;
-
-    auto &tbl = local_table();
-
-    if (rs_ip != 0) {
-      session.nat_src_port =
-          allocate_nat_src_port(rs_ip, rs_port, client_tuple, server_id);
-      session.server_tuple =
-          FiveTuple(rs_ip, client_tuple.dst_ip, rs_port, session.nat_src_port,
-                    client_tuple.protocol);
-    }
-
-    tbl.sessions[client_tuple] = session;
-
-    total_sessions_.fetch_add(1, std::memory_order_relaxed);
-    active_sessions_.fetch_add(1, std::memory_order_relaxed);
-    create_.fetch_add(1, std::memory_order_relaxed);
-    return session.nat_src_port;
-  }
-
-  void update_stats(const FiveTuple &tuple, uint64_t bytes) {
-    auto &tbl = local_table();
-    auto it = tbl.sessions.find(tuple);
-    if (it != tbl.sessions.end()) {
-      uint64_t now_tsc = rte_get_tsc_cycles();
-      if (now_tsc - it->second.last_active > touch_tsc_) {
-        it->second.last_active = now_tsc;
-      }
-      ++it->second.packets;
-      it->second.bytes += bytes;
-    } else {
-      update_miss_.fetch_add(1, std::memory_order_relaxed);
-    }
-  }
-
-  size_t cleanup_local(uint64_t now_tsc) {
-    auto &tbl = local_table();
-    if (now_tsc - tbl.last_cleanup_tsc < cleanup_interval_tsc_) {
-      return 0;
-    }
-
-    size_t removed_count = 0;
-    for (auto it = tbl.sessions.begin(); it != tbl.sessions.end();) {
-      if (it->second.is_expired(now_tsc, timeout_tsc_)) {
-        // 删除反向表条目
-        if (it->second.server_tuple.src_ip != 0) {
-          rte_hash_del_key(reverse_hash_, &it->second.server_tuple);
+        reverse_hash_ = rte_hash_create(&params);
+        if (!reverse_hash_) {
+            LOG_ERROR("Failed to create rte_hash for reverse session table: %s",
+                      rte_strerror(rte_errno));
+            return false;
         }
-        it = tbl.sessions.erase(it);
-        ++removed_count;
-        active_sessions_.fetch_sub(1, std::memory_order_relaxed);
-      } else {
-        ++it;
-      }
+
+        reverse_data_ = static_cast<ReverseEntry*>(
+            rte_zmalloc("reverse_data",
+                        sizeof(ReverseEntry) * kReverseCapacity,
+                        RTE_CACHE_LINE_SIZE));
+        if (!reverse_data_) {
+            LOG_ERROR("Failed to allocate reverse data array");
+            rte_hash_free(reverse_hash_);
+            reverse_hash_ = nullptr;
+            return false;
+        }
+
+        LOG_INFO("Reverse session hash: capacity=%u, key_len=%zu, lock-free mode",
+                 kReverseCapacity, sizeof(FiveTuple));
+        return true;
     }
-    tbl.last_cleanup_tsc = now_tsc;
-    cleanup_removed_.fetch_add(removed_count, std::memory_order_relaxed);
-    return removed_count;
-  }
 
-  Statistics get_stats() const {
-    Statistics s{};
-    s.active_sessions = active_sessions_.load(std::memory_order_relaxed);
-    s.total_sessions = total_sessions_.load(std::memory_order_relaxed);
-    return s;
-  }
+    void cleanup() {
+        if (reverse_hash_) { rte_hash_free(reverse_hash_); reverse_hash_ = nullptr; }
+        if (reverse_data_) { rte_free(reverse_data_);      reverse_data_ = nullptr; }
+    }
 
-  SessionDebugStats get_debug_stats() const {
-    SessionDebugStats s;
-    s.lookup_hit = lookup_hit_.load(std::memory_order_relaxed);
-    s.lookup_miss = lookup_miss_.load(std::memory_order_relaxed);
-    s.reverse_hit = reverse_hit_.load(std::memory_order_relaxed);
-    s.reverse_miss = reverse_miss_.load(std::memory_order_relaxed);
-    s.create = create_.load(std::memory_order_relaxed);
-    s.update_miss = update_miss_.load(std::memory_order_relaxed);
-    s.cleanup_removed = cleanup_removed_.load(std::memory_order_relaxed);
-    return s;
-  }
+    void set_timeout(uint32_t seconds) {
+        timeout_sec_            = seconds;
+        timeout_tsc_            = rte_get_tsc_hz() * seconds;
+        touch_tsc_              = timeout_tsc_ / 4;
+        cleanup_interval_tsc_   = rte_get_tsc_hz(); // 1s
+    }
+
+    // =========================================================================
+    // 热路径：正向查找（per-lcore，无锁）
+    // =========================================================================
+
+    bool lookup(const FiveTuple& tuple, Session& session) {
+        auto& tbl = local_table();
+        auto it = tbl.sessions.find(tuple);
+        if (it == tbl.sessions.end()) {
+            local_counters().lookup_miss++;
+            return false;
+        }
+        local_counters().lookup_hit++;
+        uint64_t now_tsc = rte_get_tsc_cycles();
+        if (now_tsc - it->second.last_active > touch_tsc_) {
+            it->second.last_active = now_tsc;
+        }
+        session = it->second;
+        return true;
+    }
+
+    // =========================================================================
+    // 热路径：反向查找（rte_hash Lock-Free 读路径）
+    // =========================================================================
+
+    bool lookup_reverse(const FiveTuple& reverse_tuple, Session& session) {
+        int32_t idx = rte_hash_lookup(reverse_hash_,
+                                      static_cast<const void*>(&reverse_tuple));
+        if (idx < 0) {
+            local_counters().reverse_miss++;
+            return false;
+        }
+        session.client_tuple    = reverse_data_[idx].client_tuple;
+        session.real_server_id  = reverse_data_[idx].real_server_id;
+        session.server_tuple    = reverse_tuple;
+        local_counters().reverse_hit++;
+        return true;
+    }
+
+    // =========================================================================
+    // 热路径：创建会话（写 per-lcore 正向表 + 写反向 rte_hash）
+    // =========================================================================
+
+    Port create(const FiveTuple& client_tuple, uint32_t server_id,
+                IPv4Addr rs_ip = 0, Port rs_port = 0) {
+        uint64_t tsc = rte_get_tsc_cycles();
+        Session session;
+        session.client_tuple    = client_tuple;
+        session.real_server_id  = server_id;
+        session.nat_src_port    = 0;
+        session.create_time     = tsc;
+        session.last_active     = tsc;
+        session.packets         = 0;
+        session.bytes           = 0;
+
+        auto& tbl = local_table();
+
+        if (rs_ip != 0) {
+            session.nat_src_port = allocate_nat_src_port(
+                rs_ip, rs_port, client_tuple, server_id);
+            session.server_tuple = FiveTuple(
+                rs_ip, client_tuple.dst_ip, rs_port,
+                session.nat_src_port, client_tuple.protocol);
+        }
+
+        tbl.sessions[client_tuple] = session;
+
+        auto& cnt = local_counters();
+        cnt.total_sessions++;
+        cnt.active_sessions++;
+        cnt.create++;
+
+        return session.nat_src_port;
+    }
+
+    void update_stats(const FiveTuple& tuple, uint64_t bytes) {
+        auto& tbl = local_table();
+        auto it = tbl.sessions.find(tuple);
+        if (it != tbl.sessions.end()) {
+            uint64_t now_tsc = rte_get_tsc_cycles();
+            if (now_tsc - it->second.last_active > touch_tsc_) {
+                it->second.last_active = now_tsc;
+            }
+            ++it->second.packets;
+            it->second.bytes += bytes;
+        } else {
+            local_counters().update_miss++;
+        }
+    }
+
+    size_t cleanup_local(uint64_t now_tsc) {
+        auto& tbl = local_table();
+        if (now_tsc - tbl.last_cleanup_tsc < cleanup_interval_tsc_) return 0;
+
+        size_t removed = 0;
+        for (auto it = tbl.sessions.begin(); it != tbl.sessions.end();) {
+            if (it->second.is_expired(now_tsc, timeout_tsc_)) {
+                if (it->second.server_tuple.src_ip != 0) {
+                    rte_hash_del_key(reverse_hash_, &it->second.server_tuple);
+                }
+                it = tbl.sessions.erase(it);
+                ++removed;
+            } else {
+                ++it;
+            }
+        }
+
+        if (removed > 0) {
+            auto& cnt = local_counters();
+            cnt.active_sessions   -= removed;
+            cnt.cleanup_removed   += removed;
+        }
+        tbl.last_cleanup_tsc = now_tsc;
+        return removed;
+    }
+
+    // =========================================================================
+    // 控制面：聚合所有 lcore 的统计
+    // =========================================================================
+
+    Statistics get_stats() const {
+        Statistics s{};
+        for (unsigned i = 0; i < RTE_MAX_LCORE; ++i) {
+            s.active_sessions += counters_[i].active_sessions;
+            s.total_sessions  += counters_[i].total_sessions;
+        }
+        return s;
+    }
+
+    SessionDebugStats get_debug_stats() const {
+        SessionDebugStats total{};
+        for (unsigned i = 0; i < RTE_MAX_LCORE; ++i) {
+            total.lookup_hit      += counters_[i].lookup_hit;
+            total.lookup_miss     += counters_[i].lookup_miss;
+            total.reverse_hit     += counters_[i].reverse_hit;
+            total.reverse_miss    += counters_[i].reverse_miss;
+            total.create          += counters_[i].create;
+            total.update_miss     += counters_[i].update_miss;
+            total.cleanup_removed += counters_[i].cleanup_removed;
+        }
+        return total;
+    }
 
 private:
-  SessionManager() : timeout_sec_(300), timeout_tsc_(0) {}
+    SessionManager() : timeout_sec_(300), timeout_tsc_(0) {}
 
-  /**
-   * @brief 反向表条目（存储在预分配的连续数组中）
-   */
-  struct ReverseEntry {
-    FiveTuple client_tuple;
-    uint32_t real_server_id;
-  };
+    // =========================================================================
+    // 反向表条目
+    // =========================================================================
+    struct ReverseEntry {
+        FiveTuple client_tuple;
+        uint32_t  real_server_id;
+    };
 
-  struct Table {
-    std::unordered_map<FiveTuple, Session, FiveTupleHash> sessions;
-    uint64_t last_cleanup_tsc = 0;
-  };
+    // =========================================================================
+    // Per-lcore 正向会话表
+    // =========================================================================
+    struct Table {
+        std::unordered_map<FiveTuple, Session, FiveTupleHash> sessions;
+        uint64_t last_cleanup_tsc = 0;
+    };
 
-  Table &local_table() {
-    unsigned lcore = rte_lcore_id();
-    if (lcore >= RTE_MAX_LCORE)
-      lcore = 0;
-    return tables_[lcore];
-  }
-
-  /**
-   * @brief 分配 NAT 源端口（使用 rte_hash 替代原来的 shard.map）
-   *
-   * rte_hash_add_key 返回的下标就是 reverse_data_[] 的索引，
-   * 直接写入 value，零 malloc。
-   */
-  Port allocate_nat_src_port(IPv4Addr rs_ip, Port rs_port,
-                             const FiveTuple &client_tuple,
-                             uint32_t server_id) {
-    if (!rs_ip || !rs_port)
-      return 0;
-
-    static const uint16_t kPortMin = 10000;
-    static const uint16_t kPortMax = 60000;
-    static const uint32_t kPortRange = kPortMax - kPortMin + 1;
-
-    for (uint32_t i = 0; i < kPortRange; ++i) {
-      uint32_t next = next_nat_port_.fetch_add(1, std::memory_order_relaxed);
-      uint16_t host_port = (uint16_t)(kPortMin + (next % kPortRange));
-      Port nat_port = rte_cpu_to_be_16(host_port);
-
-      FiveTuple reverse_tuple(rs_ip, client_tuple.dst_ip, rs_port, nat_port,
-                              client_tuple.protocol);
-
-      // 先查是否已存在
-      int32_t idx = rte_hash_lookup(reverse_hash_, &reverse_tuple);
-      if (idx >= 0) {
-        // 该端口已被占用，尝试下一个
-        continue;
-      }
-
-      // 不存在，插入新条目
-      idx = rte_hash_add_key(reverse_hash_, &reverse_tuple);
-      if (idx < 0) {
-        // hash 表已满或插入失败，尝试下一个端口
-        LOG_WARN("rte_hash_add_key failed: %s", rte_strerror(-idx));
-        continue;
-      }
-
-      // 写入 value（通过数组下标，零 malloc）
-      reverse_data_[idx].client_tuple = client_tuple;
-      reverse_data_[idx].real_server_id = server_id;
-      return nat_port;
+    Table& local_table() {
+        unsigned lcore = rte_lcore_id();
+        if (lcore >= RTE_MAX_LCORE) lcore = 0;
+        return tables_[lcore];
     }
 
-    LOG_WARN("NAT port allocation exhausted, fallback to client src_port");
-    return client_tuple.src_port;
-  }
+    // =========================================================================
+    // Per-lcore 计数器（替代 std::atomic，消除 cache line 竞争）
+    //
+    // sizeof = 9 × uint64_t = 72 字节，填充到 128（2 × cache_line）
+    // 每个 lcore 的计数器占据独立的 cache line，彻底消除 false sharing
+    // =========================================================================
+    struct alignas(RTE_CACHE_LINE_SIZE) LocalCounters {
+        uint64_t lookup_hit      = 0;
+        uint64_t lookup_miss     = 0;
+        uint64_t reverse_hit     = 0;
+        uint64_t reverse_miss    = 0;
+        uint64_t create          = 0;
+        uint64_t update_miss     = 0;
+        uint64_t cleanup_removed = 0;
+        uint64_t active_sessions = 0;
+        uint64_t total_sessions  = 0;
+        uint8_t  _pad[128 - 9 * sizeof(uint64_t)]; // → 128 字节
+    };
+    static_assert(sizeof(LocalCounters) == 128, "LocalCounters must be 128 bytes");
 
-  uint32_t timeout_sec_;
-  uint64_t timeout_tsc_;
-  uint64_t touch_tsc_{0};
-  uint64_t cleanup_interval_tsc_{0};
-  std::atomic<uint64_t> active_sessions_{0};
-  std::atomic<uint64_t> total_sessions_{0};
-  std::atomic<uint32_t> next_nat_port_{0};
-  std::atomic<uint64_t> lookup_hit_{0};
-  std::atomic<uint64_t> lookup_miss_{0};
-  std::atomic<uint64_t> reverse_hit_{0};
-  std::atomic<uint64_t> reverse_miss_{0};
-  std::atomic<uint64_t> create_{0};
-  std::atomic<uint64_t> update_miss_{0};
-  std::atomic<uint64_t> cleanup_removed_{0};
-  // 正向表（per-lcore，无跨核访问）
-  std::array<Table, RTE_MAX_LCORE> tables_;
+    LocalCounters& local_counters() {
+        unsigned lcore = rte_lcore_id();
+        if (lcore >= RTE_MAX_LCORE) lcore = 0;
+        return counters_[lcore];
+    }
 
-  // =========================================================================
-  // 反向表 — rte_hash + 预分配连续数组
-  //
-  // 替代原来的 1024 个 ReverseShard (spinlock + unordered_map)：
-  // - rte_hash: 管理 key(FiveTuple) 的存储和查找，SIMD 加速
-  // - reverse_data_: 连续内存数组，通过 rte_hash 返回的下标索引 value
-  // - Lock-Free 读路径: RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY_LF
-  // =========================================================================
-  static const uint32_t kReverseCapacity = 131072; // 128K 条目
-  struct rte_hash *reverse_hash_ = nullptr;
-  ReverseEntry *reverse_data_ = nullptr;
+    // =========================================================================
+    // NAT 端口按 lcore 分区分配（消除 TOCTOU + atomic 竞争）
+    //
+    // 原来所有 lcore 共享 next_nat_port_ atomic，且存在：
+    //   rte_hash_lookup → (其他 lcore 抢占) → rte_hash_add_key 的 TOCTOU 竞争
+    //
+    // 新方案：将端口范围 [kPortMin, kPortMax] 均分给每个 lcore：
+    //   lcore 0: [10000, 10000 + range - 1]
+    //   lcore 1: [10000 + range, ...]
+    //   ...
+    // 每个 lcore 只在自己的子范围内轮转分配，无需原子操作，无 TOCTOU。
+    // =========================================================================
+    Port allocate_nat_src_port(IPv4Addr rs_ip, Port rs_port,
+                               const FiveTuple& client_tuple,
+                               uint32_t server_id) {
+        if (!rs_ip || !rs_port) return 0;
 
-  SessionManager(const SessionManager &) = delete;
-  SessionManager &operator=(const SessionManager &) = delete;
+        static constexpr uint16_t kPortMin   = 10000;
+        static constexpr uint16_t kPortMax   = 60000;
+        static constexpr uint32_t kTotalRange = kPortMax - kPortMin + 1;
+
+        unsigned lcore      = rte_lcore_id();
+        if (lcore >= RTE_MAX_LCORE) lcore = 0;
+        uint32_t num_lcores = rte_lcore_count();
+        if (num_lcores == 0) num_lcores = 1;
+
+        // 每个 lcore 分配的端口子范围大小
+        uint32_t range    = kTotalRange / num_lcores;
+        if (range == 0)   range = 1;
+        uint16_t my_min   = static_cast<uint16_t>(kPortMin + lcore * range);
+        uint16_t my_max   = static_cast<uint16_t>(
+            (lcore + 1 < num_lcores) ? (my_min + range - 1) : kPortMax);
+        uint32_t my_range = my_max - my_min + 1;
+
+        // per-lcore 端口计数器（只被单个 lcore 访问，无需原子）
+        uint32_t& port_ctr = lcore_port_ctr_[lcore];
+
+        for (uint32_t i = 0; i < my_range; ++i) {
+            uint16_t host_port = static_cast<uint16_t>(
+                my_min + (port_ctr % my_range));
+            port_ctr++;
+            Port nat_port = rte_cpu_to_be_16(host_port);
+
+            FiveTuple reverse_tuple(rs_ip, client_tuple.dst_ip,
+                                    rs_port, nat_port, client_tuple.protocol);
+
+            // 先查（Lock-Free 读路径）
+            int32_t idx = rte_hash_lookup(reverse_hash_, &reverse_tuple);
+            if (idx >= 0) continue; // 已被占用（极少发生，因为范围已分区）
+
+            // 写入（同一端口的写操作在同一 lcore 上，消除了 TOCTOU）
+            idx = rte_hash_add_key(reverse_hash_, &reverse_tuple);
+            if (idx < 0) {
+                LOG_WARN("rte_hash_add_key failed: %s", rte_strerror(-idx));
+                continue;
+            }
+
+            reverse_data_[idx].client_tuple    = client_tuple;
+            reverse_data_[idx].real_server_id  = server_id;
+            return nat_port;
+        }
+
+        LOG_WARN("NAT port allocation exhausted for lcore %u, fallback", lcore);
+        return client_tuple.src_port;
+    }
+
+    // ─── 配置 ────────────────────────────────────────────────────────────────
+    uint32_t timeout_sec_;
+    uint64_t timeout_tsc_;
+    uint64_t touch_tsc_{0};
+    uint64_t cleanup_interval_tsc_{0};
+
+    // ─── Per-lcore 正向表 ────────────────────────────────────────────────────
+    std::array<Table, RTE_MAX_LCORE> tables_;
+
+    // ─── Per-lcore 计数器（无锁）────────────────────────────────────────────
+    LocalCounters counters_[RTE_MAX_LCORE]{};
+
+    // ─── Per-lcore NAT 端口计数器（无锁，替代 next_nat_port_ atomic）────────
+    uint32_t lcore_port_ctr_[RTE_MAX_LCORE]{};
+
+    // ─── 反向表（rte_hash Lock-Free 读路径）──────────────────────────────────
+    static const uint32_t kReverseCapacity = 131072;
+    struct rte_hash*  reverse_hash_ = nullptr;
+    ReverseEntry*     reverse_data_ = nullptr;
+
+    SessionManager(const SessionManager&) = delete;
+    SessionManager& operator=(const SessionManager&) = delete;
 };
 
 } // namespace l4lb
