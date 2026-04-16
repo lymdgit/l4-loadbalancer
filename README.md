@@ -122,3 +122,77 @@ ip addr show lo
 | **经过 L4 均衡器 (FULLNAT 模式)** | 108,635 | 13.05 ms |
 
 *(测试条件参考：`wrk -t4 -c2000 -d30s`，4 线程 2000 连接，压测时长 30 秒)*
+
+
+
+
+
+对于后端服务器，需要进行如下配置，调整内核相关参数，否则容易出现延迟巨大甚至丢包的情况：
+
+```bash
+  # 连接队列    
+  # 全连接队列【三次握手完成，但没来得及进行accept的队列】
+  sudo sysctl -w net.core.somaxconn=65535
+  # 半连接队列【等待三次握手的最后一个ACK时的队列】
+  sudo sysctl -w net.ipv4.tcp_max_syn_backlog=65535
+  # 网卡接收队列【内核协议栈来不及处理时，网卡允许缓存的最大数据包的数量】
+  sudo sysctl -w net.core.netdev_max_backlog=65535
+
+  # TIME_WAIT 加速回收（2000 连接高并发必须）
+  # 允许在安全范围内进行，可以参与分配了
+  sudo sysctl -w net.ipv4.tcp_tw_reuse=1
+  # 这个一般是2MSL = 60S，这里修改为15s
+  sudo sysctl -w net.ipv4.tcp_fin_timeout=15
+
+  # 文件描述符上限（2000 连接 × 4 线程需要足够 fd）
+  ulimit -n 100000
+
+```
+
+
+
+**目前本项目计划引入TREX工具进行pps的测试：**
+
+测试工具：
+
+```bash
+# 绑定网卡
+0000:03:00.0 'VMXNET3 Ethernet Controller' if=ens160 drv=vmxnet3 unused=igb_uio,vfio-pci,uio_pci_generic 
+0000:0b:00.0 'VMXNET3 Ethernet Controller' if=ens192 drv=vmxnet3 unused=igb_uio,vfio-pci,uio_pci_generic
+
+sudo vi /etc/trex_cfg.yaml
+# 将下面两个地址替换为你刚才通过 ./dpdk_setup_ports.py -s 找到的真实 PCI 地址
+# 顺序建议：先写 ens160 的 PCI，再写 ens192 的 PCI
+  interfaces: ["0000:03:00.0", "0000:0b:00.0"]
+  port_info:
+    - ip: 192.168.154.135        # 对应 Port 0 (原 ens160) 的模拟 IP
+      default_gw: 192.168.154.130  # 网关指向你的 130 DPDK 负载均衡器
+    - ip: 192.168.154.136        # 对应 Port 1 (原 ens192) 的模拟 IP
+      default_gw: 192.168.154.130  # 网关同样指向 130 节点
+      
+# 把配置信心加载进去
+sudo ./dpdk_setup_ports.py -c /etc/trex_cfg.yaml      
+
+# 分配大页内存
+sudo sh -c 'echo 1024 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages'
+
+# 启动服务端
+sudo ./t-rex-64 -i -c 2
+
+
+# 启动测试端
+./trex-console
+trex> service
+trex> arp
+trex> service --off
+
+# 运行脚本，开始测试
+trex> start -f lb_test.py -m 10kpps -p 0
+# 实时显示
+trex> tui
+# 关闭测试
+trex> stop -a
+
+
+```
+
