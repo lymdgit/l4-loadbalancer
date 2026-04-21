@@ -35,8 +35,8 @@
 #include "common/logger.h"
 #include "common/types.h"
 #include "core/loadbalancer.h"
-#include "lb/session.h"
 #include "lb/real_server.h"
+#include "lb/session.h"
 
 using namespace l4lb;
 
@@ -47,7 +47,7 @@ using namespace l4lb;
 #define TX_RING_SIZE 4096   // 增大 TX 缓冲区，减少 DR 模式丢包
 #define NUM_MBUFS 65535     // 增大内存池 (prev: 16383)
 #define MBUF_CACHE_SIZE 512 // 每一个lcore缓存512个mbuf
-#define BURST_SIZE 64       // 增大批处理，提升吞吐
+#define BURST_SIZE 32       // 增大批处理，提升吞吐
 
 // ============================================================================
 // 全局变量
@@ -69,11 +69,11 @@ static uint64_t g_tx_offloads_enabled = 0;
 // alignas(RTE_CACHE_LINE_SIZE) 保证相邻槽不共享 cache line（false sharing）。
 // ============================================================================
 struct alignas(RTE_CACHE_LINE_SIZE) LcoreNicStats {
-    uint64_t rx      = 0;
-    uint64_t tx      = 0;
-    uint64_t dropped = 0;
-    // 3 × 8 = 24 字节，填充到 64（一个 cache line）
-    uint8_t  _pad[RTE_CACHE_LINE_SIZE - 3 * sizeof(uint64_t)];
+  uint64_t rx = 0;
+  uint64_t tx = 0;
+  uint64_t dropped = 0;
+  // 3 × 8 = 24 字节，填充到 64（一个 cache line）
+  uint8_t _pad[RTE_CACHE_LINE_SIZE - 3 * sizeof(uint64_t)];
 };
 static_assert(sizeof(LcoreNicStats) == RTE_CACHE_LINE_SIZE,
               "LcoreNicStats must be exactly one cache line");
@@ -109,7 +109,8 @@ static inline void tx_buffer_flush(TxBuffer *buf, uint16_t port,
 
   // Per-lcore 统计，无需原子操作
   unsigned lid = rte_lcore_id();
-  if (lid >= RTE_MAX_LCORE) lid = 0;
+  if (lid >= RTE_MAX_LCORE)
+    lid = 0;
   g_nic_stats[lid].tx += nb_tx;
 
   if (unlikely(nb_tx < buf->count)) {
@@ -371,15 +372,15 @@ static int worker_loop(void *arg) {
         // 聚合所有 lcore 的 NIC 统计（仅控制面，不在热路径）
         uint64_t total_rx = 0, total_tx = 0, total_dropped = 0;
         for (unsigned i = 0; i < RTE_MAX_LCORE; ++i) {
-            total_rx      += g_nic_stats[i].rx;
-            total_tx      += g_nic_stats[i].tx;
-            total_dropped += g_nic_stats[i].dropped;
+          total_rx += g_nic_stats[i].rx;
+          total_tx += g_nic_stats[i].tx;
+          total_dropped += g_nic_stats[i].dropped;
         }
 
         LOG_INFO("=== L4 LB Statistics (RSS: %u queues, Batch TX) ===",
                  g_num_queues);
-        LOG_INFO("DPDK RX: %lu, TX: %lu, Dropped: %lu",
-                 total_rx, total_tx, total_dropped);
+        LOG_INFO("DPDK RX: %lu, TX: %lu, Dropped: %lu", total_rx, total_tx,
+                 total_dropped);
         LOG_INFO("LB RX: %lu, TX: %lu, Dropped: %lu", stats.rx_packets,
                  stats.tx_packets, stats.dropped_packets);
         LOG_INFO("ARP: %lu, ICMP: %lu, TCP: %lu, UDP: %lu", stats.arp_packets,
@@ -604,12 +605,12 @@ int main(int argc, char *argv[]) {
   LOG_INFO("Final Statistics:");
   uint64_t final_rx = 0, final_tx = 0, final_dropped = 0;
   for (unsigned i = 0; i < RTE_MAX_LCORE; ++i) {
-      final_rx      += g_nic_stats[i].rx;
-      final_tx      += g_nic_stats[i].tx;
-      final_dropped += g_nic_stats[i].dropped;
+    final_rx += g_nic_stats[i].rx;
+    final_tx += g_nic_stats[i].tx;
+    final_dropped += g_nic_stats[i].dropped;
   }
-  LOG_INFO("  DPDK RX: %lu, TX: %lu, Dropped: %lu",
-           final_rx, final_tx, final_dropped);
+  LOG_INFO("  DPDK RX: %lu, TX: %lu, Dropped: %lu", final_rx, final_tx,
+           final_dropped);
   LOG_INFO("  LB Forwarded: %lu", final_stats.forwarded_packets);
   LOG_INFO("  Total Sessions: %lu", final_sess.total_sessions);
   LOG_INFO("========================================================");

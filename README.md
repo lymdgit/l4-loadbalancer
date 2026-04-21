@@ -131,11 +131,9 @@ ip addr show lo
 
 ```bash
   # 连接队列    
-  # 全连接队列【三次握手完成，但没来得及进行accept的队列】
+  # 全连接队列 + 半连接 + 网卡接收队列
   sudo sysctl -w net.core.somaxconn=65535
-  # 半连接队列【等待三次握手的最后一个ACK时的队列】
   sudo sysctl -w net.ipv4.tcp_max_syn_backlog=65535
-  # 网卡接收队列【内核协议栈来不及处理时，网卡允许缓存的最大数据包的数量】
   sudo sysctl -w net.core.netdev_max_backlog=65535
 
   # TIME_WAIT 加速回收（2000 连接高并发必须）
@@ -146,6 +144,16 @@ ip addr show lo
 
   # 文件描述符上限（2000 连接 × 4 线程需要足够 fd）
   ulimit -n 100000
+
+
+
+	#对于mpstat -P ALL 1所发现的%soft不均匀问题进行如下操作
+	# 假设网卡名是 ens33，把软中断分散到所有 4 个核（0xF = 二进制 1111）
+	echo "f" > /sys/class/net/ens33/queues/rx-0/rps_cpus
+	# 启用 RFS（Receive Flow Steering）让流量自动路由到处理该连接的 CPU
+	echo 32768 > /proc/sys/net/core/rps_sock_flow_entries
+	echo 32768 > /sys/class/net/ens33/queues/rx-0/rps_flow_cnt
+
 
 ```
 
