@@ -315,6 +315,9 @@ static int worker_loop(void *arg) {
   LOG_INFO("Worker started on lcore %u, queue %u%s (batch TX enabled)",
            lcore_id, queue_id, is_master ? " (master)" : "");
 
+  // 注册当前 lcore 为 RCU QSBR 读者线程
+  SessionManager::instance().register_lcore();
+
   while (g_running) {
     // -----------------------------------------------------------------------
     // 【热路径】核心业务：收包 + 转发，保持最高频执行，不在此处读时钟
@@ -347,6 +350,9 @@ static int worker_loop(void *arg) {
     // -----------------------------------------------------------------------
     if (unlikely((local_loop_count & 1023) == 0)) {
       cur_tsc = rte_get_tsc_cycles();
+
+      // 报告 RCU 静默状态：此刻没有持有任何旧的 hash slot 引用
+      SessionManager::instance().quiescent_state();
 
       // 定期刷新 TX buffer（超时未满也发送，避免延迟积压）
       if (tx_buf.count > 0 && (cur_tsc - tx_buf.last_drain_tsc) > drain_tsc) {
@@ -402,6 +408,9 @@ static int worker_loop(void *arg) {
 
   // 退出前刷新剩余的 TX buffer
   tx_buffer_flush(&tx_buf, g_port_id, queue_id);
+
+  // 注销当前 lcore 的 RCU 读者身份
+  SessionManager::instance().unregister_lcore();
 
   LOG_INFO("Worker on lcore %u exiting", lcore_id);
   return 0;

@@ -21,6 +21,8 @@
  *
  * 4. 保留：正向会话表 per-lcore（原已实现，无跨核访问）
  * 5. 保留：反向会话表 rte_hash + RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY_LF
+ *    + RCU QSBR 延迟回收：del_key 后 slot 进入 defer queue，
+ *      等所有 lcore 报告静默后自动释放，避免 slot 泄漏和 Use-After-Free。
  */
 
 #ifndef L4LB_LB_SESSION_H
@@ -34,6 +36,7 @@
 #include <rte_hash.h>
 #include <rte_jhash.h>
 #include <rte_lcore.h>
+#include <rte_rcu_qsbr.h>
 #include <rte_malloc.h>
 
 #include "common/logger.h"
@@ -68,14 +71,14 @@ public:
         params.socket_id        = rte_socket_id();
         // Lock-Free 读路径，写路径内部 CAS
         params.extra_flag       = RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY_LF;
-
+        // 创建 rte_hash 
         reverse_hash_ = rte_hash_create(&params);
         if (!reverse_hash_) {
             LOG_ERROR("Failed to create rte_hash for reverse session table: %s",
                       rte_strerror(rte_errno));
             return false;
         }
-
+        // 分配一块内存 用来存储结构体数组
         reverse_data_ = static_cast<ReverseEntry*>(
             rte_zmalloc("reverse_data",
                         sizeof(ReverseEntry) * kReverseCapacity,
@@ -87,7 +90,44 @@ public:
             return false;
         }
 
-        LOG_INFO("Reverse session hash: capacity=%u, key_len=%zu, lock-free mode",
+        // ---- RCU QSBR 初始化 ----
+        // RW_CONCURRENCY_LF 下 del_key 不释放 slot，需要 RCU 延迟回收
+        size_t qsbr_sz = rte_rcu_qsbr_get_memsize(RTE_MAX_LCORE);
+        qsbr_ = static_cast<struct rte_rcu_qsbr*>(
+            rte_zmalloc("session_qsbr", qsbr_sz, RTE_CACHE_LINE_SIZE));
+        if (!qsbr_) {
+            LOG_ERROR("Failed to allocate RCU QSBR variable");
+            rte_free(reverse_data_); reverse_data_ = nullptr;
+            rte_hash_free(reverse_hash_); reverse_hash_ = nullptr;
+            return false;
+        }
+        // 初始化QSBR变量，支持最多4核心
+        if (rte_rcu_qsbr_init(qsbr_, RTE_MAX_LCORE) != 0) {
+            LOG_ERROR("Failed to init RCU QSBR");
+            rte_free(qsbr_); qsbr_ = nullptr;
+            rte_free(reverse_data_); reverse_data_ = nullptr;
+            rte_hash_free(reverse_hash_); reverse_hash_ = nullptr;
+            return false;
+        }
+        // 配置RCU相关设置
+        // 将 QSBR 关联到 rte_hash，启用 DQ 模式（延迟队列自动回收 slot）
+        struct rte_hash_rcu_config rcu_cfg = {};
+        rcu_cfg.v = qsbr_;
+        rcu_cfg.mode = RTE_HASH_QSBR_MODE_DQ;
+        rcu_cfg.dq_size = 1024;
+        rcu_cfg.trigger_reclaim_limit = 0;
+        rcu_cfg.max_reclaim_size = 0;
+        // 关联RCU到rte_hash
+        int rcu_ret = rte_hash_rcu_qsbr_add(reverse_hash_, &rcu_cfg);
+        if (rcu_ret != 0) {
+            LOG_ERROR("Failed to add RCU QSBR to hash: %s", rte_strerror(-rcu_ret));
+            rte_free(qsbr_); qsbr_ = nullptr;
+            rte_free(reverse_data_); reverse_data_ = nullptr;
+            rte_hash_free(reverse_hash_); reverse_hash_ = nullptr;
+            return false;
+        }
+
+        LOG_INFO("Reverse session hash: capacity=%u, key_len=%zu, lock-free + RCU QSBR (DQ)",
                  kReverseCapacity, sizeof(FiveTuple));
         return true;
     }
@@ -95,6 +135,7 @@ public:
     void cleanup() {
         if (reverse_hash_) { rte_hash_free(reverse_hash_); reverse_hash_ = nullptr; }
         if (reverse_data_) { rte_free(reverse_data_);      reverse_data_ = nullptr; }
+        if (qsbr_)         { rte_free(qsbr_);              qsbr_ = nullptr;         }
     }
 
     void set_timeout(uint32_t seconds) {
@@ -102,6 +143,31 @@ public:
         timeout_tsc_            = rte_get_tsc_hz() * seconds;
         touch_tsc_              = timeout_tsc_ / 4;
         cleanup_interval_tsc_   = rte_get_tsc_hz(); // 1s
+    }
+
+    // =========================================================================
+    // RCU QSBR 线程管理（worker 入口/出口调用）
+    // =========================================================================
+
+    /** 注册当前 lcore 为 RCU QSBR 读者线程（worker 启动时调用） */
+    void register_lcore() {
+        unsigned lcore = rte_lcore_id();
+        rte_rcu_qsbr_thread_register(qsbr_, lcore);
+        rte_rcu_qsbr_thread_online(qsbr_, lcore);
+        LOG_INFO("RCU QSBR: lcore %u registered & online", lcore);
+    }
+
+    /** 注销当前 lcore 的 RCU QSBR 读者身份（worker 退出时调用） */
+    void unregister_lcore() {
+        unsigned lcore = rte_lcore_id();
+        rte_rcu_qsbr_thread_offline(qsbr_, lcore);
+        rte_rcu_qsbr_thread_unregister(qsbr_, lcore);
+        LOG_INFO("RCU QSBR: lcore %u offline & unregistered", lcore);
+    }
+
+    /** 报告当前 lcore 经过一个静默期（worker 主循环周期性调用） */
+    void quiescent_state() {
+        rte_rcu_qsbr_quiescent(qsbr_, rte_lcore_id());
     }
 
     // =========================================================================
@@ -378,10 +444,11 @@ private:
     // ─── Per-lcore NAT 端口计数器（无锁，替代 next_nat_port_ atomic）────────
     uint32_t lcore_port_ctr_[RTE_MAX_LCORE]{};
 
-    // ─── 反向表（rte_hash Lock-Free 读路径）──────────────────────────────────
+    // ─── 反向表（rte_hash Lock-Free 读路径 + RCU QSBR 延迟回收）─────────────
     static const uint32_t kReverseCapacity = 131072;
-    struct rte_hash*  reverse_hash_ = nullptr;
-    ReverseEntry*     reverse_data_ = nullptr;
+    struct rte_hash*      reverse_hash_ = nullptr;
+    ReverseEntry*         reverse_data_ = nullptr;
+    struct rte_rcu_qsbr*  qsbr_         = nullptr;
 
     SessionManager(const SessionManager&) = delete;
     SessionManager& operator=(const SessionManager&) = delete;
