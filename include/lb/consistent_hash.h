@@ -13,12 +13,12 @@
 #ifndef L4LB_LB_CONSISTENT_HASH_H
 #define L4LB_LB_CONSISTENT_HASH_H
 
-#include <cstdint>
-#include <map>
-#include <vector>
-#include <string>
-#include <mutex>
 #include "common/types.h"
+#include <algorithm>
+#include <cstdint>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace l4lb {
 
@@ -99,43 +99,39 @@ public:
      * @brief 添加节点
      */
     void add_node(uint32_t server_id, uint32_t weight = 100) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        
         uint32_t replicas = (virtual_nodes_ * weight) / 100;
         if (replicas < 1) replicas = 1;
         
         for (uint32_t i = 0; i < replicas; ++i) {
             std::string key = std::to_string(server_id) + "#" + std::to_string(i);
             uint32_t hash = MurmurHash3::hash(key.data(), key.size());
-            ring_[hash] = server_id;
+            ring_.push_back({hash, server_id});
         }
+        std::sort(ring_.begin(), ring_.end(),
+                  [](const auto &a, const auto &b) { return a.first < b.first; });
     }
     
     /**
      * @brief 移除节点
      */
     void remove_node(uint32_t server_id) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        
-        for (auto it = ring_.begin(); it != ring_.end(); ) {
-            if (it->second == server_id) {
-                it = ring_.erase(it);
-            } else {
-                ++it;
-            }
-        }
+        ring_.erase(std::remove_if(ring_.begin(), ring_.end(),
+                                   [server_id](const auto &node) {
+                                       return node.second == server_id;
+                                   }),
+                    ring_.end());
     }
     
     /**
      * @brief 根据五元组选择服务器
      */
     bool get_server(const FiveTuple& tuple, uint32_t& server_id) const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        
         if (ring_.empty()) return false;
         
         uint32_t hash = MurmurHash3::hash_tuple(tuple);
-        auto it = ring_.lower_bound(hash);
+        auto it = std::lower_bound(
+            ring_.begin(), ring_.end(), hash,
+            [](const auto &node, uint32_t value) { return node.first < value; });
         
         if (it == ring_.end()) {
             it = ring_.begin();
@@ -149,7 +145,6 @@ public:
      * @brief 获取节点数量
      */
     size_t node_count() const {
-        std::lock_guard<std::mutex> lock(mutex_);
         return ring_.size();
     }
     
@@ -157,14 +152,12 @@ public:
      * @brief 清空哈希环
      */
     void clear() {
-        std::lock_guard<std::mutex> lock(mutex_);
         ring_.clear();
     }
     
 private:
     uint32_t virtual_nodes_;
-    mutable std::mutex mutex_;
-    std::map<uint32_t, uint32_t> ring_;  // hash -> server_id
+    std::vector<std::pair<uint32_t, uint32_t>> ring_;  // hash -> server_id
 };
 
 } // namespace l4lb

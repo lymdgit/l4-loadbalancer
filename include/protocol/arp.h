@@ -11,7 +11,6 @@
 #define L4LB_PROTOCOL_ARP_H
 
 #include <array>
-#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -55,9 +54,8 @@ struct ArpEntry {
     bool complete;
     
     ArpEntry() : mac{}, timestamp(0), complete(false) {}
-    ArpEntry(const MacAddr& m) : mac(m), complete(true) {
-        timestamp = std::chrono::steady_clock::now().time_since_epoch().count();
-    }
+    ArpEntry(const MacAddr& m, uint64_t now_tsc)
+        : mac(m), timestamp(now_tsc), complete(true) {}
 };
 
 /// ARP 表管理类 - 分片减少锁竞争
@@ -68,10 +66,16 @@ public:
     
     static ArpTable& instance() { static ArpTable t; return t; }
     
-    void update(IPv4Addr ip, const MacAddr& mac) {
+    void update(IPv4Addr ip, const MacAddr& mac, uint64_t now_tsc) {
         auto &shard = shards_[hash_ip(ip) % kNumShards];
         std::lock_guard<std::mutex> lock(shard.mutex);
-        shard.table[ip] = ArpEntry(mac);
+        auto it = shard.table.find(ip);
+        if (it != shard.table.end() && it->second.complete &&
+            it->second.mac == mac) {
+            it->second.timestamp = now_tsc;
+            return;
+        }
+        shard.table[ip] = ArpEntry(mac, now_tsc);
     }
     
     bool lookup(IPv4Addr ip, MacAddr& mac) const {
@@ -101,23 +105,25 @@ private:
 class ArpHandler {
 public:
     static bool handle(EthernetHeader* eth, ArpHeader* arp,
-                       IPv4Addr local_ip, const MacAddr& local_mac) {
+                       IPv4Addr local_ip, const MacAddr& local_mac,
+                       uint64_t now_tsc) {
         if (arp->is_request()) {
-            return handle_request(eth, arp, local_ip, local_mac);
+            return handle_request(eth, arp, local_ip, local_mac, now_tsc);
         }
         if (arp->is_reply()) {
             MacAddr mac; memcpy(mac.data(), arp->sender_mac, 6);
-            ArpTable::instance().update(arp->sender_ip, mac);
+            ArpTable::instance().update(arp->sender_ip, mac, now_tsc);
         }
         return false;
     }
     
     static bool handle_request(EthernetHeader* eth, ArpHeader* arp,
-                                IPv4Addr local_ip, const MacAddr& local_mac) {
+                                IPv4Addr local_ip, const MacAddr& local_mac,
+                                uint64_t now_tsc) {
         if (arp->target_ip != local_ip) return false;
         
         MacAddr sender_mac; memcpy(sender_mac.data(), arp->sender_mac, 6);
-        ArpTable::instance().update(arp->sender_ip, sender_mac);
+        ArpTable::instance().update(arp->sender_ip, sender_mac, now_tsc);
         
         eth->swap_mac();
         eth->set_src_mac(local_mac);
