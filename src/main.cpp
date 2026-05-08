@@ -17,7 +17,6 @@
  * @author L4 Load Balancer Project
  */
 
-#include <atomic>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -25,12 +24,14 @@
 #include <string>
 #include <vector>
 
+#include <rte_common.h>
 #include <rte_cycles.h>
 #include <rte_eal.h>
 #include <rte_ethdev.h>
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
 #include <rte_mempool.h>
+#include <rte_prefetch.h>
 
 #include "common/config.h"
 #include "common/logger.h"
@@ -55,15 +56,36 @@ using namespace l4lb;
 // ============================================================================
 static volatile bool g_running = true;
 static LoadBalancer g_lb; // 负载均衡相关配置：一致性hash
-static uint64_t g_loop_count = 0;
 static uint16_t g_port_id = 0; // 默认使用端口 0
 static struct rte_mempool *g_mbuf_pool = nullptr;
 static uint64_t g_tx_offloads_enabled = 0;
 
-// 统计信息 (使用 atomic 保证多核安全)
-static std::atomic<uint64_t> g_stats_rx{0};
-static std::atomic<uint64_t> g_stats_tx{0};
-static std::atomic<uint64_t> g_stats_dropped{0};
+// Per-lcore DPDK counters avoid hot-path atomic contention.
+struct DpdkCoreStats {
+  uint64_t rx = 0;
+  uint64_t tx = 0;
+  uint64_t dropped = 0;
+} __rte_cache_aligned;
+
+static DpdkCoreStats g_dpdk_stats[RTE_MAX_LCORE];
+
+static inline DpdkCoreStats &local_dpdk_stats() {
+  unsigned lcore = rte_lcore_id();
+  if (unlikely(lcore >= RTE_MAX_LCORE)) {
+    lcore = rte_get_main_lcore();
+  }
+  return g_dpdk_stats[lcore];
+}
+
+static DpdkCoreStats aggregate_dpdk_stats() {
+  DpdkCoreStats total;
+  for (const auto &stats : g_dpdk_stats) {
+    total.rx += stats.rx;
+    total.tx += stats.tx;
+    total.dropped += stats.dropped;
+  }
+  return total;
+}
 
 // 多队列配置
 static uint16_t g_num_queues = 1;
@@ -86,17 +108,17 @@ struct TxBuffer {
 // 刷新 TX buffer
 // 把积攒了一批的包发送出去
 static inline void tx_buffer_flush(TxBuffer *buf, uint16_t port,
-                                   uint16_t queue) {
+                                   uint16_t queue, DpdkCoreStats &stats) {
   if (buf->count == 0)
     return;
 
   uint16_t nb_tx = rte_eth_tx_burst(port, queue, buf->pkts, buf->count);
   // 原子变量，统计发出去多少包
-  g_stats_tx += nb_tx;
+  stats.tx += nb_tx;
 
   // 释放未发送的包：未能成功发送的包，直接释放掉
   if (unlikely(nb_tx < buf->count)) {
-    g_stats_dropped += (buf->count - nb_tx);
+    stats.dropped += (buf->count - nb_tx);
     for (uint16_t i = nb_tx; i < buf->count; ++i) {
       rte_pktmbuf_free(buf->pkts[i]);
     }
@@ -106,12 +128,13 @@ static inline void tx_buffer_flush(TxBuffer *buf, uint16_t port,
 
 // 添加包到 TX buffer
 static inline void tx_buffer_add(TxBuffer *buf, struct rte_mbuf *mbuf,
-                                 uint16_t port, uint16_t queue) {
+                                 uint16_t port, uint16_t queue,
+                                 DpdkCoreStats &stats) {
   buf->pkts[buf->count++] = mbuf; // 把当前mbuf指针存到数组里面，等待批量发送
 
   // Buffer 满了就发送
   if (buf->count >= TX_BATCH_SIZE) {
-    tx_buffer_flush(buf, port, queue);
+    tx_buffer_flush(buf, port, queue, stats);
   }
 }
 
@@ -259,13 +282,15 @@ static int port_init(uint16_t port, struct rte_mempool *mbuf_pool,
 // ============================================================================
 // 处理单个数据包 (返回是否需要发送)
 // ============================================================================
-static inline struct rte_mbuf *process_packet_batch(struct rte_mbuf *mbuf) {
+static inline struct rte_mbuf *process_packet_batch(struct rte_mbuf *mbuf,
+                                                    uint64_t now_tsc,
+                                                    DpdkCoreStats &stats) {
   uint8_t *data = rte_pktmbuf_mtod(mbuf, uint8_t *);
   size_t len = rte_pktmbuf_data_len(mbuf);
 
   // 调用 LoadBalancer 处理
   bool should_send = false;
-  bool handled = g_lb.process_packet(mbuf, data, len, should_send);
+  bool handled = g_lb.process_packet(mbuf, data, len, now_tsc, should_send);
 
   if (handled && should_send) {
     return mbuf; // 返回需要发送的包
@@ -273,7 +298,7 @@ static inline struct rte_mbuf *process_packet_batch(struct rte_mbuf *mbuf) {
     // 不发送，释放 mbuf
     rte_pktmbuf_free(mbuf);
     if (!handled) {
-      ++g_stats_dropped;
+      stats.dropped++;
     }
     return nullptr; // 不需要发送
   }
@@ -285,6 +310,7 @@ static inline struct rte_mbuf *process_packet_batch(struct rte_mbuf *mbuf) {
 static int worker_loop(void *arg) {
   uint16_t queue_id = *static_cast<uint16_t *>(arg);
   unsigned lcore_id = rte_lcore_id();
+  DpdkCoreStats &core_stats = local_dpdk_stats();
 
   struct rte_mbuf *bufs[BURST_SIZE];
   TxBuffer tx_buf = {.pkts = {}, .count = 0, .last_drain_tsc = 0};
@@ -308,18 +334,22 @@ static int worker_loop(void *arg) {
 
     if (nb_rx > 0) {
       // 原子变量：统计接收到的总包数
-      g_stats_rx += nb_rx;
+      core_stats.rx += nb_rx;
 
       // 批量处理每个数据包
       for (uint16_t i = 0; i < nb_rx; ++i) {
-        struct rte_mbuf *to_send = process_packet_batch(bufs[i]);
+        if (i + 1 < nb_rx) {
+          rte_prefetch0(rte_pktmbuf_mtod(bufs[i + 1], void *));
+        }
+        struct rte_mbuf *to_send =
+            process_packet_batch(bufs[i], cur_tsc, core_stats);
         if (to_send) {
           // 内联函数，只在调用处展开，没有函数调用开销
-          tx_buffer_add(&tx_buf, to_send, g_port_id, queue_id);
+          tx_buffer_add(&tx_buf, to_send, g_port_id, queue_id, core_stats);
         }
       }
       if (tx_buf.count > 0) {
-        tx_buffer_flush(&tx_buf, g_port_id, queue_id);
+        tx_buffer_flush(&tx_buf, g_port_id, queue_id, core_stats);
         tx_buf.last_drain_tsc = cur_tsc; // 用缓存的 cur_tsc，避免再读时钟
       }
     }
@@ -335,7 +365,7 @@ static int worker_loop(void *arg) {
 
       // 定期刷新 TX buffer（超时未满也发送，避免延迟积压）
       if (tx_buf.count > 0 && (cur_tsc - tx_buf.last_drain_tsc) > drain_tsc) {
-        tx_buffer_flush(&tx_buf, g_port_id, queue_id);
+        tx_buffer_flush(&tx_buf, g_port_id, queue_id, core_stats);
         tx_buf.last_drain_tsc = cur_tsc;
       }
 
@@ -352,12 +382,13 @@ static int worker_loop(void *arg) {
         g_lb.send_arp_probes(g_port_id, g_mbuf_pool);
 
         auto stats = g_lb.get_stats();
+        auto dpdk_stats = aggregate_dpdk_stats();
         auto sess_stats = SessionManager::instance().get_stats();
         auto sess_dbg = SessionManager::instance().get_debug_stats();
         LOG_INFO("=== L4 LB Statistics (RSS: %u queues, Batch TX) ===",
                  g_num_queues);
-        LOG_INFO("DPDK RX: %lu, TX: %lu, Dropped: %lu", g_stats_rx.load(),
-                 g_stats_tx.load(), g_stats_dropped.load());
+        LOG_INFO("DPDK RX: %lu, TX: %lu, Dropped: %lu", dpdk_stats.rx,
+                 dpdk_stats.tx, dpdk_stats.dropped);
         LOG_INFO("LB RX: %lu, TX: %lu, Dropped: %lu", stats.rx_packets,
                  stats.tx_packets, stats.dropped_packets);
         LOG_INFO("ARP: %lu, ICMP: %lu, TCP: %lu, UDP: %lu", stats.arp_packets,
@@ -378,7 +409,7 @@ static int worker_loop(void *arg) {
   }
 
   // 退出前刷新剩余的 TX buffer
-  tx_buffer_flush(&tx_buf, g_port_id, queue_id);
+  tx_buffer_flush(&tx_buf, g_port_id, queue_id, core_stats);
 
   LOG_INFO("Worker on lcore %u exiting", lcore_id);
   return 0;
@@ -578,9 +609,10 @@ int main(int argc, char *argv[]) {
   LOG_INFO("========================================================");
   LOG_INFO("L4 Load Balancer stopped");
   auto final_stats = g_lb.get_stats();
+  auto final_dpdk = aggregate_dpdk_stats();
   auto final_sess = SessionManager::instance().get_stats();
   LOG_INFO("Final Statistics:");
-  LOG_INFO("  DPDK RX: %lu, TX: %lu", g_stats_rx.load(), g_stats_tx.load());
+  LOG_INFO("  DPDK RX: %lu, TX: %lu", final_dpdk.rx, final_dpdk.tx);
   LOG_INFO("  LB Forwarded: %lu", final_stats.forwarded_packets);
   LOG_INFO("  Total Sessions: %lu", final_sess.total_sessions);
   LOG_INFO("========================================================");
