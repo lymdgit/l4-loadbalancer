@@ -8,18 +8,19 @@
 #define L4LB_LB_REAL_SERVER_H
 
 #include <array>
+#include <cstddef>
+#include <cstdint>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
 
-#include "common/config.h"
 #include "common/types.h"
 #include "lb/consistent_hash.h"
 
 namespace l4lb {
 
 /**
- * @brief Real Server 管理器
+ * @brief Real Server 管理器（实现见 src/lb/real_server.cpp）
  *
  * 优化：servers_array_ 提供 O(1) 无锁读路径，get_server 高频调用不再加锁
  */
@@ -32,117 +33,30 @@ public:
         return mgr;
     }
 
-    /**
-     * @brief 从配置加载服务器
-     */
-    bool load_from_config() {
-        auto& cfg = Config::instance();
-        auto servers = cfg.get_real_servers();
+    /// 从 Config 加载服务器并构建哈希环
+    bool load_from_config();
 
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (size_t i = 0; i < servers.size(); ++i) {
-            RealServer rs;
-            rs.id = static_cast<uint32_t>(i + 1);
-            rs.ip = ip_from_string(servers[i].ip);
-            rs.port = servers[i].port;
-            rs.mac = mac_from_string(servers[i].mac);
-            rs.weight = servers[i].weight;
-            rs.status = ServerStatus::UP;
+    /// 添加服务器
+    void add_server(const RealServer& rs);
 
-            servers_[rs.id] = rs;
-            if (rs.id < kMaxServers) {
-                servers_array_[rs.id] = rs;
-            }
-            hash_ring_.add_node(rs.id, rs.weight);
-        }
-        return true;
-    }
+    /// 移除服务器
+    void remove_server(uint32_t id);
 
-    /**
-     * @brief 添加服务器
-     */
-    void add_server(const RealServer& rs) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        servers_[rs.id] = rs;
-        if (rs.id < kMaxServers) {
-            servers_array_[rs.id] = rs;
-        }
-        hash_ring_.add_node(rs.id, rs.weight);
-    }
+    /// 设置服务器状态
+    void set_status(uint32_t id, ServerStatus status);
 
-    /**
-     * @brief 移除服务器
-     */
-    void remove_server(uint32_t id) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        servers_.erase(id);
-        if (id < kMaxServers) {
-            servers_array_[id] = RealServer{};
-        }
-        hash_ring_.remove_node(id);
-    }
+    /// 按五元组选择服务器，无可用服务器返回 nullptr
+    RealServer* select_server(const FiveTuple& tuple);
 
-    /**
-     * @brief 设置服务器状态
-     */
-    void set_status(uint32_t id, ServerStatus status) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = servers_.find(id);
-        if (it != servers_.end()) {
-            it->second.status = status;
-            if (id < kMaxServers) {
-                servers_array_[id].status = status;
-            }
-        }
-    }
+    /// 获取服务器 - 无锁快速路径（id < kMaxServers 时）；不可用返回 nullptr
+    RealServer* get_server(uint32_t id);
 
-    /**
-     * @brief 选择服务器
-     */
-    RealServer* select_server(const FiveTuple& tuple) {
-        uint32_t server_id;
-        if (!hash_ring_.get_server(tuple, server_id)) {
-            return nullptr;
-        }
+    /// 获取所有服务器（拷贝）
+    std::vector<RealServer> get_all_servers() const;
 
-        return get_server(server_id);
-    }
+    /// 获取服务器数量
+    size_t count() const;
 
-    /**
-     * @brief 获取服务器 - 无锁快速路径（id < kMaxServers 时）
-     */
-    RealServer* get_server(uint32_t id) {
-        if (id < kMaxServers && id > 0 && servers_array_[id].id == id) {
-            return servers_array_[id].is_available() ? &servers_array_[id]
-                                                     : nullptr;
-        }
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = servers_.find(id);
-        return it != servers_.end() && it->second.is_available() ? &it->second
-                                                                 : nullptr;
-    }
-    
-    /**
-     * @brief 获取所有服务器
-     */
-    std::vector<RealServer> get_all_servers() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        std::vector<RealServer> result;
-        result.reserve(servers_.size());
-        for (const auto& [id, rs] : servers_) {
-            result.push_back(rs);
-        }
-        return result;
-    }
-    
-    /**
-     * @brief 获取服务器数量
-     */
-    size_t count() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return servers_.size();
-    }
-    
 private:
     RealServerManager() : hash_ring_(150) {}
 

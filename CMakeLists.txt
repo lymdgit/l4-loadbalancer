@@ -19,7 +19,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # 优先使用 pkg-config 查找 DPDK
 find_package(PkgConfig)
 if(PKG_CONFIG_FOUND)
-    pkg_check_modules(DPDK libdpdk)
+    pkg_check_modules(DPDK IMPORTED_TARGET libdpdk)
 endif()
 
 # 如果 pkg-config 找不到，使用手动配置
@@ -71,25 +71,30 @@ endif()
 # ============================================================================
 # 源文件收集
 # ============================================================================
-file(GLOB_RECURSE COMMON_SOURCES  "src/common/*.cpp")
-file(GLOB_RECURSE CORE_SOURCES    "src/core/*.cpp")
-file(GLOB_RECURSE PROTOCOL_SOURCES "src/protocol/*.cpp")
-file(GLOB_RECURSE LB_SOURCES      "src/lb/*.cpp")
-file(GLOB_RECURSE FORWARD_SOURCES "src/forward/*.cpp")
-
-set(ALL_SOURCES
-    src/main.cpp
-    ${COMMON_SOURCES}
-    ${CORE_SOURCES}
-    ${PROTOCOL_SOURCES}
-    ${LB_SOURCES}
-    ${FORWARD_SOURCES}
-)
+# src/ 与 include/ 目录一一对应：
+#   common/    配置、日志、公共类型
+#   protocol/  协议头、解析、校验和、ARP/ICMP
+#   lb/        会话表、RS 管理、一致性哈希
+#   forward/   NAT / DR 转发引擎
+#   core/      LoadBalancer 报文分发
+#   dataplane/ 端口初始化、worker 循环、数据面全局状态
+# CONFIGURE_DEPENDS：新增 .cpp 后重新构建即可被收集，无需手动重跑 cmake
+file(GLOB_RECURSE ALL_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/*.cpp")
 
 # ============================================================================
 # 主程序目标
 # ============================================================================
 add_executable(l4lb ${ALL_SOURCES})
+
+# 拆分为多个 .cpp 后，开启 LTO 让编译器仍能跨文件内联热路径函数
+include(CheckIPOSupported)
+check_ipo_supported(RESULT L4LB_IPO_OK OUTPUT L4LB_IPO_MSG LANGUAGES CXX)
+if(L4LB_IPO_OK)
+    set_property(TARGET l4lb PROPERTY INTERPROCEDURAL_OPTIMIZATION ON)
+    message(STATUS "LTO: enabled")
+else()
+    message(STATUS "LTO: not supported (${L4LB_IPO_MSG})")
+endif()
 
 # ============================================================================
 # 链接 DPDK 库（纯 DPDK，不依赖 F-Stack）
@@ -97,8 +102,8 @@ add_executable(l4lb ${ALL_SOURCES})
 
 if(DPDK_FOUND)
     # 使用 pkg-config 找到的配置
-    target_link_libraries(l4lb ${DPDK_LIBRARIES})
-    target_compile_options(l4lb PRIVATE ${DPDK_CFLAGS_OTHER})
+    # 导入目标自带头文件路径、库路径和编译选项
+    target_link_libraries(l4lb PkgConfig::DPDK)
 else()
     # 手动链接 DPDK 库
     link_directories(${DPDK_LIB_PATH})

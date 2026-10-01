@@ -7,9 +7,9 @@
 #ifndef L4LB_PROTOCOL_ICMP_H
 #define L4LB_PROTOCOL_ICMP_H
 
+#include <cstddef>
 #include <cstdint>
 #include "common/types.h"
-#include "protocol/ethernet.h"
 
 namespace l4lb {
 
@@ -35,51 +35,20 @@ struct __attribute__((packed)) IcmpHeader {
 
 static_assert(sizeof(IcmpHeader) == 8, "IcmpHeader size must be 8 bytes");
 
-/// ICMP 处理类
+/// ICMP 处理类（实现见 src/protocol/icmp.cpp）
 class IcmpHandler {
 public:
+    /// 计算校验和
+    static uint16_t calculate_checksum(const uint8_t* data, size_t len);
+
     /**
-     * @brief 计算校验和
-     */
-    static uint16_t calculate_checksum(const uint8_t* data, size_t len) {
-        uint32_t sum = 0;
-        const uint16_t* ptr = reinterpret_cast<const uint16_t*>(data);
-        
-        while (len > 1) {
-            sum += *ptr++;
-            len -= 2;
-        }
-        if (len == 1) {
-            sum += *reinterpret_cast<const uint8_t*>(ptr);
-        }
-        
-        while (sum >> 16) {
-            sum = (sum & 0xFFFF) + (sum >> 16);
-        }
-        return static_cast<uint16_t>(~sum);
-    }
-    
-    /**
-     * @brief 处理 ICMP Echo Request，生成 Echo Reply
+     * @brief 处理 ICMP Echo Request，原地改写为 Echo Reply
      * 
      * @param icmp ICMP 头指针
      * @param icmp_len ICMP 数据长度（含数据）
      * @return true 需要发送响应
      */
-    static bool handle_echo_request(IcmpHeader* icmp, size_t icmp_len) {
-        if (!icmp->is_echo_request()) return false;
-        
-        // 修改类型为 Echo Reply
-        icmp->type = static_cast<uint8_t>(IcmpType::ECHO_REPLY);
-        icmp->code = 0;
-        
-        // 重新计算校验和
-        icmp->checksum = 0;
-        icmp->checksum = calculate_checksum(
-            reinterpret_cast<uint8_t*>(icmp), icmp_len);
-        
-        return true;
-    }
+    static bool handle_echo_request(IcmpHeader* icmp, size_t icmp_len);
 };
 
 } // namespace l4lb

@@ -1,6 +1,8 @@
 /**
  * @file forwarder.h
  * @brief 转发引擎接口
+ *
+ * 具体实现：forward/nat_forwarder.h（FULLNAT）、forward/dr_forwarder.h（DR）
  * @author L4 Load Balancer Project
  */
 
@@ -8,11 +10,8 @@
 #define L4LB_FORWARD_FORWARDER_H
 
 #include "common/types.h"
-#include "lb/real_server.h"
-#include "protocol/ethernet.h"
-#include "protocol/ip.h"
+#include <cstddef>
 #include <cstdint>
-
 
 namespace l4lb {
 

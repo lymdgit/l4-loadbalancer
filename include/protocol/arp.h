@@ -1,9 +1,9 @@
 /**
  * @file arp.h
  * @brief ARP 协议处理
- * 
+ *
  * ARP 用于将 IP 地址解析为 MAC 地址。
- * 
+ *
  * @author L4 Load Balancer Project
  */
 
@@ -11,13 +11,11 @@
 #define L4LB_PROTOCOL_ARP_H
 
 #include <array>
-#include <chrono>
+#include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <mutex>
 #include <unordered_map>
 #include "common/types.h"
-#include "common/logger.h"
 #include "protocol/ethernet.h"
 
 namespace l4lb {
@@ -39,7 +37,7 @@ struct __attribute__((packed)) ArpHeader {
     uint32_t sender_ip;
     uint8_t  target_mac[6];
     uint32_t target_ip;
-    
+
     ArpOperation get_operation() const { return static_cast<ArpOperation>(ntohs(operation)); }
     void set_operation(ArpOperation op) { operation = htons(static_cast<uint16_t>(op)); }
     bool is_request() const { return get_operation() == ArpOperation::REQUEST; }
@@ -53,43 +51,29 @@ struct ArpEntry {
     MacAddr mac;
     uint64_t timestamp;
     bool complete;
-    
+
     ArpEntry() : mac{}, timestamp(0), complete(false) {}
-    ArpEntry(const MacAddr& m) : mac(m), complete(true) {
-        timestamp = std::chrono::steady_clock::now().time_since_epoch().count();
-    }
+    explicit ArpEntry(const MacAddr& m);
 };
 
-/// ARP 表管理类 - 分片减少锁竞争
+/// ARP 表管理类 - 分片减少锁竞争（实现见 src/protocol/arp.cpp）
 class ArpTable {
 public:
     static constexpr size_t kNumShards = 256;
     static constexpr uint64_t ENTRY_TIMEOUT = 300;
-    
+
     static ArpTable& instance() { static ArpTable t; return t; }
-    
-    void update(IPv4Addr ip, const MacAddr& mac) {
-        auto &shard = shards_[hash_ip(ip) % kNumShards];
-        std::lock_guard<std::mutex> lock(shard.mutex);
-        shard.table[ip] = ArpEntry(mac);
-    }
-    
-    bool lookup(IPv4Addr ip, MacAddr& mac) const {
-        auto &shard = shards_[hash_ip(ip) % kNumShards];
-        std::lock_guard<std::mutex> lock(shard.mutex);
-        auto it = shard.table.find(ip);
-        if (it != shard.table.end() && it->second.complete) {
-            mac = it->second.mac;
-            return true;
-        }
-        return false;
-    }
-    
+
+    /// 学习或刷新一条 IP -> MAC 映射
+    void update(IPv4Addr ip, const MacAddr& mac);
+
+    /// 查找 IP 对应的 MAC，找到返回 true
+    bool lookup(IPv4Addr ip, MacAddr& mac) const;
+
 private:
     ArpTable() = default;
-    static size_t hash_ip(IPv4Addr ip) {
-        return std::hash<uint32_t>{}(ip);
-    }
+    static size_t hash_ip(IPv4Addr ip);
+
     struct Shard {
         std::mutex mutex;
         std::unordered_map<IPv4Addr, ArpEntry> table;
@@ -97,60 +81,26 @@ private:
     mutable std::array<Shard, kNumShards> shards_;
 };
 
-/// ARP 协议处理类
+/// ARP 协议处理类（实现见 src/protocol/arp.cpp）
 class ArpHandler {
 public:
+    /**
+     * @brief 处理一个 ARP 报文
+     * @return true 报文已被原地改写为 ARP Reply，需要发送
+     */
     static bool handle(EthernetHeader* eth, ArpHeader* arp,
-                       IPv4Addr local_ip, const MacAddr& local_mac) {
-        if (arp->is_request()) {
-            return handle_request(eth, arp, local_ip, local_mac);
-        }
-        if (arp->is_reply()) {
-            MacAddr mac; memcpy(mac.data(), arp->sender_mac, 6);
-            ArpTable::instance().update(arp->sender_ip, mac);
-        }
-        return false;
-    }
-    
+                       IPv4Addr local_ip, const MacAddr& local_mac);
+
+    /// 处理 ARP Request：目标是本机时原地改写为 Reply
     static bool handle_request(EthernetHeader* eth, ArpHeader* arp,
-                                IPv4Addr local_ip, const MacAddr& local_mac) {
-        if (arp->target_ip != local_ip) return false;
-        
-        MacAddr sender_mac; memcpy(sender_mac.data(), arp->sender_mac, 6);
-        ArpTable::instance().update(arp->sender_ip, sender_mac);
-        
-        eth->swap_mac();
-        eth->set_src_mac(local_mac);
-        
-        arp->set_operation(ArpOperation::REPLY);
-        memcpy(arp->target_mac, arp->sender_mac, 6);
-        arp->target_ip = arp->sender_ip;
-        memcpy(arp->sender_mac, local_mac.data(), 6);
-        arp->sender_ip = local_ip;
-        
-        return true;
-    }
-    
+                               IPv4Addr local_ip, const MacAddr& local_mac);
+
+    /**
+     * @brief 在 buf 中构造一个广播 ARP Request
+     * @return 帧长度
+     */
     static size_t build_request(uint8_t* buf, IPv4Addr target_ip,
-                                 IPv4Addr local_ip, const MacAddr& local_mac) {
-        auto* eth = reinterpret_cast<EthernetHeader*>(buf);
-        auto* arp = reinterpret_cast<ArpHeader*>(buf + sizeof(EthernetHeader));
-        
-        memset(eth->dst_mac, 0xFF, 6);
-        memcpy(eth->src_mac, local_mac.data(), 6);
-        eth->set_ether_type(static_cast<uint16_t>(EtherType::ARP));
-        
-        arp->hw_type = htons(1);
-        arp->proto_type = htons(0x0800);
-        arp->hw_len = 6; arp->proto_len = 4;
-        arp->set_operation(ArpOperation::REQUEST);
-        memcpy(arp->sender_mac, local_mac.data(), 6);
-        arp->sender_ip = local_ip;
-        memset(arp->target_mac, 0, 6);
-        arp->target_ip = target_ip;
-        
-        return sizeof(EthernetHeader) + sizeof(ArpHeader);
-    }
+                                IPv4Addr local_ip, const MacAddr& local_mac);
 };
 
 } // namespace l4lb

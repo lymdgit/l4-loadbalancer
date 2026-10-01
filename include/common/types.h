@@ -16,10 +16,9 @@
 #define L4LB_COMMON_TYPES_H
 
 #include <array>
-#include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <functional>
 #include <string>
 
 namespace l4lb {
@@ -107,26 +106,18 @@ enum class ErrorCode : int {
 // ============================================================================
 
 /**
- * @brief 五元组结构
+ * @brief 五元组结构 (packed, 用于 rte_hash memcmp key)
  *
- * 五元组是标识一个 TCP/UDP 连接的关键信息：
- * - 源 IP 地址
- * - 源端口
- * - 目的 IP 地址
- * - 目的端口
- * - 协议类型 (TCP/UDP)
- *
- * 用于：
+ * 五元组是标识一个 TCP/UDP 连接的关键信息，用于：
  * 1. 一致性哈希选择后端服务器
  * 2. 会话表查找
  * 3. 连接跟踪
- */
-/**
- * @brief 五元组结构 (packed, 用于 rte_hash memcmp key)
  *
  * 使用 __attribute__((packed)) 消除 padding 字节，
  * 构造时用 memset 保证所有字节为 0，
  * 确保 rte_hash 的 memcmp 比较完全正确。
+ *
+ * 热路径上每包都会构造和比较，因此保留为头文件内联实现。
  */
 struct __attribute__((packed)) FiveTuple {
   IPv4Addr src_ip;  ///< 源 IP 地址 (网络字节序)
@@ -135,16 +126,8 @@ struct __attribute__((packed)) FiveTuple {
   Port dst_port;    ///< 目的端口 (网络字节序)
   uint8_t protocol; ///< 协议类型 (TCP=6, UDP=17)
 
-  /**
-   * @brief 默认构造函数
-   */
-  FiveTuple() {
-    memset(this, 0, sizeof(*this));
-  }
+  FiveTuple() { memset(this, 0, sizeof(*this)); }
 
-  /**
-   * @brief 参数化构造函数
-   */
   FiveTuple(IPv4Addr sip, IPv4Addr dip, Port sp, Port dp, uint8_t proto) {
     memset(this, 0, sizeof(*this));
     src_ip = sip;
@@ -154,22 +137,12 @@ struct __attribute__((packed)) FiveTuple {
     protocol = proto;
   }
 
-  /**
-   * @brief 相等比较运算符
-   *
-   * 用于会话表的查找操作
-   */
+  /// 相等比较运算符，用于会话表的查找操作
   bool operator==(const FiveTuple &other) const {
     return memcmp(this, &other, sizeof(FiveTuple)) == 0;
   }
 
-  /**
-   * @brief 生成反向五元组
-   *
-   * 用于构建返回方向的会话条目
-   *
-   * @return 反向的五元组（源和目的交换）
-   */
+  /// 生成反向五元组（源和目的交换）
   FiveTuple reverse() const {
     return FiveTuple(dst_ip, src_ip, dst_port, src_port, protocol);
   }
@@ -177,11 +150,10 @@ struct __attribute__((packed)) FiveTuple {
 
 /**
  * @brief 五元组的哈希函数 - 快速 FNV-1a 风格混合
+ *
+ * 异或然后乘以一个大的素数，速度快，碰撞率低。
+ * unordered_map 查找时会内联这个函数，避免函数跳转开销。
  */
-// 快速哈希函数，用于计算五元组的哈希值
-// 编译器回在unordered_map编译的时候，内联这个函数，硬塞进去find源码里
-// 避免了函数跳转的开销
-// FNV-1a风格的hash算法，速度快，碰撞率低   异或然后乘以一个大的素数
 struct FiveTupleHash {
   size_t operator()(const FiveTuple &tuple) const {
     size_t h = 14695981039346656037ULL;
@@ -205,7 +177,7 @@ struct FiveTupleHash {
  *
  * 设计思想：
  * - 一次解析，多次使用
- * - 零拷贝设计：保存指针而非拷贝数据
+ * - 零拷贝设计：保存偏移而非拷贝数据
  */
 struct PacketMeta {
   // 以太网层信息
@@ -233,11 +205,7 @@ struct PacketMeta {
   uint16_t total_len;   ///< 数据包总长度
   uint16_t payload_len; ///< 载荷长度
 
-  /**
-   * @brief 提取五元组
-   *
-   * @return 从元信息构建的五元组
-   */
+  /// 提取五元组
   FiveTuple to_five_tuple() const {
     return FiveTuple(src_ip, dst_ip, src_port, dst_port, ip_protocol);
   }
@@ -266,17 +234,12 @@ struct RealServer {
   uint64_t bytes_in;   ///< 入站字节数
   uint64_t bytes_out;  ///< 出站字节数
 
-  /**
-   * @brief 默认构造函数
-   */
   RealServer()
       : id(0), ip(0), port(0), mac{}, weight(100),
         status(ServerStatus::CHECKING), conn_count(0), total_conn(0),
         bytes_in(0), bytes_out(0) {}
 
-  /**
-   * @brief 检查服务器是否可用
-   */
+  /// 检查服务器是否可用
   bool is_available() const { return status == ServerStatus::UP; }
 };
 
@@ -301,9 +264,7 @@ struct Session {
   uint64_t packets;        ///< 数据包计数
   uint64_t bytes;          ///< 字节计数
 
-  /**
-   * @brief 更新活跃时间（使用 TSC，避免 chrono 系统调用）
-   */
+  /// 更新活跃时间（使用 TSC，避免 chrono 系统调用）
   void touch(uint64_t tsc) { last_active = tsc; }
 
   /**
@@ -345,14 +306,12 @@ struct Statistics {
   uint64_t active_sessions; ///< 当前活跃会话
   uint64_t total_sessions;  ///< 总会话数
 
-  /**
-   * @brief 重置所有计数器
-   */
+  /// 重置所有计数器
   void reset() { std::memset(this, 0, sizeof(Statistics)); }
 };
 
 // ============================================================================
-// 工具函数
+// 工具函数（实现见 src/common/types.cpp）
 // ============================================================================
 
 /**
@@ -361,62 +320,27 @@ struct Statistics {
  * 注意：返回的是网络字节序（大端），与数据包中的格式一致
  *
  * @param ip_str IP 地址字符串 (如 "192.168.1.1")
- * @return 网络字节序的 IP 地址
+ * @return 网络字节序的 IP 地址，解析失败返回 0
  */
-inline IPv4Addr ip_from_string(const std::string &ip_str) {
-  uint32_t a, b, c, d;
-  if (sscanf(ip_str.c_str(), "%u.%u.%u.%u", &a, &b, &c, &d) != 4) {
-    return 0;
-  }
-  // 存储为网络字节序（大端）：第一个字节在最低地址
-  // 在小端机器上，(d << 24) | (c << 16) | (b << 8) | a 会产生网络字节序
-  return (d << 24) | (c << 16) | (b << 8) | a;
-}
+IPv4Addr ip_from_string(const std::string &ip_str);
 
 /**
  * @brief 网络字节序 IP 转字符串
- *
- * @param ip 网络字节序的 IP 地址
- * @return IP 地址字符串
  */
-inline std::string ip_to_string(IPv4Addr ip) {
-  char buf[16];
-  // ip 是网络字节序，最低字节是第一段
-  snprintf(buf, sizeof(buf), "%u.%u.%u.%u", ip & 0xFF, (ip >> 8) & 0xFF,
-           (ip >> 16) & 0xFF, (ip >> 24) & 0xFF);
-  return std::string(buf);
-}
+std::string ip_to_string(IPv4Addr ip);
 
 /**
  * @brief MAC 地址字符串转字节数组
  *
  * @param mac_str MAC 地址字符串 (如 "00:0C:29:3E:38:92")
- * @return MAC 地址数组
+ * @return MAC 地址数组，解析失败返回全 0
  */
-inline MacAddr mac_from_string(const std::string &mac_str) {
-  MacAddr mac{};
-  unsigned int a[6];
-  if (sscanf(mac_str.c_str(), "%x:%x:%x:%x:%x:%x", &a[0], &a[1], &a[2], &a[3],
-             &a[4], &a[5]) == 6) {
-    for (int i = 0; i < 6; ++i) {
-      mac[i] = static_cast<uint8_t>(a[i]);
-    }
-  }
-  return mac;
-}
+MacAddr mac_from_string(const std::string &mac_str);
 
 /**
  * @brief MAC 地址转字符串
- *
- * @param mac MAC 地址数组
- * @return MAC 地址字符串
  */
-inline std::string mac_to_string(const MacAddr &mac) {
-  char buf[18];
-  snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1],
-           mac[2], mac[3], mac[4], mac[5]);
-  return std::string(buf);
-}
+std::string mac_to_string(const MacAddr &mac);
 
 } // namespace l4lb
 
