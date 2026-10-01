@@ -6,6 +6,7 @@
 #include "dataplane/worker.h"
 
 #include "common/logger.h"
+#include "common/stats.h"
 #include "common/types.h"
 #include "core/loadbalancer.h"
 #include "dataplane/context.h"
@@ -37,17 +38,17 @@ struct TxBuffer {
 // 刷新 TX buffer
 // 把积攒了一批的包发送出去
 static inline void tx_buffer_flush(TxBuffer *buf, uint16_t port,
-                                   uint16_t queue) {
+                                   uint16_t queue, PortLcoreStats &st) {
   if (buf->count == 0)
     return;
 
   uint16_t nb_tx = rte_eth_tx_burst(port, queue, buf->pkts, buf->count);
-  // 原子变量，统计发出去多少包
-  g_stats_tx += nb_tx;
+  // per-lcore 计数，统计发出去多少包
+  stat_add(st.tx, nb_tx);
 
   // 释放未发送的包：未能成功发送的包，直接释放掉
   if (unlikely(nb_tx < buf->count)) {
-    g_stats_dropped += (buf->count - nb_tx);
+    stat_add(st.dropped, buf->count - nb_tx);
     for (uint16_t i = nb_tx; i < buf->count; ++i) {
       rte_pktmbuf_free(buf->pkts[i]);
     }
@@ -57,19 +58,21 @@ static inline void tx_buffer_flush(TxBuffer *buf, uint16_t port,
 
 // 添加包到 TX buffer
 static inline void tx_buffer_add(TxBuffer *buf, struct rte_mbuf *mbuf,
-                                 uint16_t port, uint16_t queue) {
+                                 uint16_t port, uint16_t queue,
+                                 PortLcoreStats &st) {
   buf->pkts[buf->count++] = mbuf; // 把当前mbuf指针存到数组里面，等待批量发送
 
   // Buffer 满了就发送
   if (buf->count >= TX_BATCH_SIZE) {
-    tx_buffer_flush(buf, port, queue);
+    tx_buffer_flush(buf, port, queue, st);
   }
 }
 
 // ============================================================================
 // 处理单个数据包 (返回是否需要发送)
 // ============================================================================
-static inline struct rte_mbuf *process_packet_batch(struct rte_mbuf *mbuf) {
+static inline struct rte_mbuf *process_packet_batch(struct rte_mbuf *mbuf,
+                                                    PortLcoreStats &st) {
   uint8_t *data = rte_pktmbuf_mtod(mbuf, uint8_t *);
   size_t len = rte_pktmbuf_data_len(mbuf);
 
@@ -83,7 +86,7 @@ static inline struct rte_mbuf *process_packet_batch(struct rte_mbuf *mbuf) {
     // 不发送，释放 mbuf
     rte_pktmbuf_free(mbuf);
     if (!handled) {
-      ++g_stats_dropped;
+      stat_add(st.dropped);
     }
     return nullptr; // 不需要发送
   }
@@ -95,6 +98,8 @@ static inline struct rte_mbuf *process_packet_batch(struct rte_mbuf *mbuf) {
 int worker_loop(void *arg) {
   uint16_t queue_id = *static_cast<uint16_t *>(arg);
   unsigned lcore_id = rte_lcore_id();
+  PortLcoreStats &port_st = g_port_stats[stat_lcore()];
+  auto &sessions = SessionManager::instance();
 
   struct rte_mbuf *bufs[BURST_SIZE];
   TxBuffer tx_buf = {.pkts = {}, .count = 0, .last_drain_tsc = 0};
@@ -110,29 +115,35 @@ int worker_loop(void *arg) {
   LOG_INFO("Worker started on lcore %u, queue %u%s (batch TX enabled)",
            lcore_id, queue_id, is_master ? " (master)" : "");
 
-  while (g_running) {
+  // 注册到反向表的 RCU：之后每轮循环报告一次静默期
+  sessions.worker_online(lcore_id);
+
+  while (g_running.load(std::memory_order_relaxed)) {
     // -----------------------------------------------------------------------
     // 【热路径】核心业务：收包 + 转发，保持最高频执行，不在此处读时钟
     // -----------------------------------------------------------------------
     uint16_t nb_rx = rte_eth_rx_burst(g_port_id, queue_id, bufs, BURST_SIZE);
 
     if (nb_rx > 0) {
-      // 原子变量：统计接收到的总包数
-      g_stats_rx += nb_rx;
+      // per-lcore 计数：统计接收到的总包数
+      stat_add(port_st.rx, nb_rx);
 
       // 批量处理每个数据包
       for (uint16_t i = 0; i < nb_rx; ++i) {
-        struct rte_mbuf *to_send = process_packet_batch(bufs[i]);
+        struct rte_mbuf *to_send = process_packet_batch(bufs[i], port_st);
         if (to_send) {
           // 内联函数，只在调用处展开，没有函数调用开销
-          tx_buffer_add(&tx_buf, to_send, g_port_id, queue_id);
+          tx_buffer_add(&tx_buf, to_send, g_port_id, queue_id, port_st);
         }
       }
       if (tx_buf.count > 0) {
-        tx_buffer_flush(&tx_buf, g_port_id, queue_id);
+        tx_buffer_flush(&tx_buf, g_port_id, queue_id, port_st);
         tx_buf.last_drain_tsc = cur_tsc; // 用缓存的 cur_tsc，避免再读时钟
       }
     }
+
+    // 本轮处理完毕，不再持有任何反向表 value 指针
+    sessions.quiescent(lcore_id);
 
     ++local_loop_count;
 
@@ -145,13 +156,13 @@ int worker_loop(void *arg) {
 
       // 定期刷新 TX buffer（超时未满也发送，避免延迟积压）
       if (tx_buf.count > 0 && (cur_tsc - tx_buf.last_drain_tsc) > drain_tsc) {
-        tx_buffer_flush(&tx_buf, g_port_id, queue_id);
+        tx_buffer_flush(&tx_buf, g_port_id, queue_id, port_st);
         tx_buf.last_drain_tsc = cur_tsc;
       }
 
       // 定期清理过期会话（每 500000 次循环 ≈ 每 512*1024 次循环检查一次）
       if ((local_loop_count & 524287) == 0) { // 524287 = 512*1024 - 1
-        size_t cleaned = SessionManager::instance().cleanup_local(cur_tsc);
+        size_t cleaned = sessions.cleanup_local(cur_tsc);
         if (cleaned > 0 && is_master) {
           LOG_INFO("Cleaned %zu expired sessions (local)", cleaned);
         }
@@ -159,15 +170,16 @@ int worker_loop(void *arg) {
 
       // 定期打印统计信息 & 发送 ARP 探测（只有 master 执行）
       if (is_master && cur_tsc - last_stats_time >= stats_interval) {
-        g_lb.send_arp_probes(g_port_id, g_mbuf_pool);
+        g_lb.send_arp_probes(g_port_id, queue_id, g_mbuf_pool);
 
+        auto port_total = port_stats_total();
         auto stats = g_lb.get_stats();
-        auto sess_stats = SessionManager::instance().get_stats();
-        auto sess_dbg = SessionManager::instance().get_debug_stats();
+        auto sess_stats = sessions.get_stats();
+        auto sess_dbg = sessions.get_debug_stats();
         LOG_INFO("=== L4 LB Statistics (RSS: %u queues, Batch TX) ===",
                  g_num_queues);
-        LOG_INFO("DPDK RX: %lu, TX: %lu, Dropped: %lu", g_stats_rx.load(),
-                 g_stats_tx.load(), g_stats_dropped.load());
+        LOG_INFO("DPDK RX: %lu, TX: %lu, Dropped: %lu", port_total.rx,
+                 port_total.tx, port_total.dropped);
         LOG_INFO("LB RX: %lu, TX: %lu, Dropped: %lu", stats.rx_packets,
                  stats.tx_packets, stats.dropped_packets);
         LOG_INFO("ARP: %lu, ICMP: %lu, TCP: %lu, UDP: %lu", stats.arp_packets,
@@ -176,9 +188,11 @@ int worker_loop(void *arg) {
                  stats.forwarded_packets, stats.nat_translations,
                  sess_stats.active_sessions);
         LOG_INFO("Sess dbg: lk hit %lu miss %lu | rev hit %lu miss %lu | "
-                 "create %lu | upd miss %lu | cleanup %lu",
+                 "create %lu fail %lu replaced %lu | upd miss %lu | "
+                 "cleanup %lu",
                  sess_dbg.lookup_hit, sess_dbg.lookup_miss,
                  sess_dbg.reverse_hit, sess_dbg.reverse_miss, sess_dbg.create,
+                 sess_dbg.create_fail, sess_dbg.replaced,
                  sess_dbg.update_miss, sess_dbg.cleanup_removed);
         LOG_INFO("========================");
 
@@ -188,7 +202,10 @@ int worker_loop(void *arg) {
   }
 
   // 退出前刷新剩余的 TX buffer
-  tx_buffer_flush(&tx_buf, g_port_id, queue_id);
+  tx_buffer_flush(&tx_buf, g_port_id, queue_id, port_st);
+
+  // 退出 RCU：之后反向表回收不再等待本 lcore
+  sessions.worker_offline(lcore_id);
 
   LOG_INFO("Worker on lcore %u exiting", lcore_id);
   return 0;

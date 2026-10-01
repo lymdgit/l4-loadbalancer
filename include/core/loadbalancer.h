@@ -11,12 +11,17 @@
 #define L4LB_CORE_LOADBALANCER_H
 
 #include "common/types.h"
+#include <array>
 #include <atomic>
+#include <bitset>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <unordered_set>
+
+#include <rte_common.h> // RTE_CACHE_LINE_SIZE
+#include <rte_config.h> // RTE_MAX_LCORE
 
 struct rte_mempool;
 
@@ -54,18 +59,37 @@ public:
   bool process_packet(void *mbuf, uint8_t *data, size_t len,
                       bool &should_send);
 
-  /// 获取统计信息
-  Statistics get_stats() const { return stats_; }
+  /// 汇总所有 lcore 的统计信息
+  Statistics get_stats() const;
 
   void set_tx_offload_caps(uint64_t caps) { tx_offload_caps_ = caps; }
 
   /// 停止
   void stop() { running_ = false; }
 
-  /// 主动发送 ARP 请求探测所有后端服务器
-  void send_arp_probes(uint16_t port_id, struct rte_mempool *pool);
+  /**
+   * @brief 主动发送 ARP 请求探测所有后端服务器
+   * @param queue_id 调用方 lcore 自己的 TX 队列（TX 队列不能跨核共用）
+   */
+  void send_arp_probes(uint16_t port_id, uint16_t queue_id,
+                       struct rte_mempool *pool);
 
 private:
+  /// per-lcore 统计，只由所属 lcore 写（见 common/stats.h）
+  struct alignas(RTE_CACHE_LINE_SIZE) LcoreStats {
+    std::atomic<uint64_t> rx_packets{0};
+    std::atomic<uint64_t> tx_packets{0};
+    std::atomic<uint64_t> dropped_packets{0};
+    std::atomic<uint64_t> arp_packets{0};
+    std::atomic<uint64_t> icmp_packets{0};
+    std::atomic<uint64_t> tcp_packets{0};
+    std::atomic<uint64_t> udp_packets{0};
+    std::atomic<uint64_t> forwarded_packets{0};
+    std::atomic<uint64_t> nat_translations{0};
+  };
+
+  LcoreStats &local_stats();
+
   /// 处理 ARP
   bool handle_arp(EthernetHeader *eth, uint8_t *data, size_t len);
 
@@ -78,33 +102,31 @@ private:
 
   /// 处理 ICMP（Ping 本机）
   bool handle_icmp(EthernetHeader *eth, IPv4Header *ip, uint8_t *data,
-                   size_t len, const PacketMeta &meta);
+                   const PacketMeta &meta);
 
   /**
    * @brief 处理入站流量（DNAT）
    *
    * Client -> VIP:port  =>  Client -> RS:port
    */
-  bool handle_inbound(EthernetHeader *eth, uint8_t *data, size_t len,
-                      const PacketMeta &meta, void *mbuf);
+  bool handle_inbound(uint8_t *data, size_t len, const PacketMeta &meta,
+                      void *mbuf);
 
   /**
    * @brief 处理返回流量（SNAT）
    *
    * RS:port -> Client  =>  VIP:port -> Client
    */
-  bool handle_return(EthernetHeader *eth, uint8_t *data, size_t len,
-                     const PacketMeta &meta, void *mbuf);
+  bool handle_return(uint8_t *data, size_t len, const PacketMeta &meta,
+                     void *mbuf);
 
   /// 判断 IP 是否属于 Real Server
   bool is_from_realserver(IPv4Addr ip) const {
     return rs_ips_.find(ip) != rs_ips_.end();
   }
 
-  /// 判断 IP 是否是 Real Server 的 IP（别名，语义更清晰）
-  bool is_realserver_ip(IPv4Addr ip) const {
-    return rs_ips_.find(ip) != rs_ips_.end();
-  }
+  /// 目的端口（网络字节序）是否是配置的 VIP 服务端口
+  bool is_service_port(Port port_be) const;
 
   std::atomic<bool> running_;
   IPv4Addr local_ip_;
@@ -112,9 +134,10 @@ private:
   std::unique_ptr<Forwarder> forwarder_; // 转发引擎（NAT / DR）
   // 方便判断是否是回程流量
   std::unordered_set<IPv4Addr> rs_ips_; // Real Server IP 集合
+  std::bitset<65536> service_ports_;    // VIP 服务端口（主机字节序下标）
   bool is_nat_mode_ = false;
   uint64_t tx_offload_caps_ = 0;
-  Statistics stats_{};
+  std::array<LcoreStats, RTE_MAX_LCORE> stats_;
 };
 
 } // namespace l4lb

@@ -19,6 +19,8 @@
 #ifndef L4LB_COMMON_LOGGER_H
 #define L4LB_COMMON_LOGGER_H
 
+#include <atomic>
+#include <cstdint>
 #include <mutex>
 #include <string>
 
@@ -64,7 +66,7 @@ public:
      * @param level 日志级别
      */
     void set_level(LogLevel level) {
-        level_ = level;
+        level_.store(level, std::memory_order_relaxed);
     }
     
     /**
@@ -78,7 +80,7 @@ public:
      * @brief 获取当前日志级别
      */
     LogLevel get_level() const {
-        return level_;
+        return level_.load(std::memory_order_relaxed);
     }
     
     /**
@@ -88,7 +90,8 @@ public:
      * @return true 如果该级别的日志会被输出
      */
     bool is_enabled(LogLevel level) const {
-        return static_cast<int>(level) >= static_cast<int>(level_);
+        return static_cast<int>(level) >=
+               static_cast<int>(level_.load(std::memory_order_relaxed));
     }
     
     /**
@@ -117,9 +120,16 @@ private:
      */
     static const char* get_level_str(LogLevel level);
     
-    LogLevel level_;        ///< 当前日志级别
+    std::atomic<LogLevel> level_;  ///< 当前日志级别（多核读取）
     std::mutex mutex_;      ///< 输出互斥锁
 };
+
+/**
+ * @brief 限速判断：距离上次输出不足 interval_sec 秒时返回 false
+ *
+ * @param last 调用点私有的上次输出时间（秒，0 表示从未输出）
+ */
+bool log_ratelimit_pass(std::atomic<int64_t>& last, int64_t interval_sec);
 
 } // namespace l4lb
 
@@ -132,39 +142,53 @@ private:
 // 3. 短路求值避免不必要的参数计算
 // ============================================================================
 
-/// 调试日志（Release 编译可移除）
+/// 先判断级别再求值参数：级别未开启时，ip_to_string() 等参数表达式不会执行
+#define L4LB_LOG(level, fmt, ...) \
+    do { \
+        if (__builtin_expect(l4lb::Logger::instance().is_enabled(level), 0)) { \
+            l4lb::Logger::instance().log(level, \
+                __FILE__, __LINE__, __func__, fmt, ##__VA_ARGS__); \
+        } \
+    } while (0)
+
+/// 调试日志（定义 NDEBUG 时完全移除）
 #ifndef NDEBUG
-#define LOG_DEBUG(fmt, ...) \
-    l4lb::Logger::instance().log(l4lb::LogLevel::DEBUG, \
-        __FILE__, __LINE__, __func__, fmt, ##__VA_ARGS__)
+#define LOG_DEBUG(fmt, ...) L4LB_LOG(l4lb::LogLevel::DEBUG, fmt, ##__VA_ARGS__)
 #else
 #define LOG_DEBUG(fmt, ...) ((void)0)
 #endif
 
 /// 信息日志
-#define LOG_INFO(fmt, ...) \
-    l4lb::Logger::instance().log(l4lb::LogLevel::INFO, \
-        __FILE__, __LINE__, __func__, fmt, ##__VA_ARGS__)
+#define LOG_INFO(fmt, ...) L4LB_LOG(l4lb::LogLevel::INFO, fmt, ##__VA_ARGS__)
 
 /// 警告日志
-#define LOG_WARN(fmt, ...) \
-    l4lb::Logger::instance().log(l4lb::LogLevel::WARN, \
-        __FILE__, __LINE__, __func__, fmt, ##__VA_ARGS__)
+#define LOG_WARN(fmt, ...) L4LB_LOG(l4lb::LogLevel::WARN, fmt, ##__VA_ARGS__)
 
 /// 错误日志
-#define LOG_ERROR(fmt, ...) \
-    l4lb::Logger::instance().log(l4lb::LogLevel::ERROR, \
-        __FILE__, __LINE__, __func__, fmt, ##__VA_ARGS__)
+#define LOG_ERROR(fmt, ...) L4LB_LOG(l4lb::LogLevel::ERROR, fmt, ##__VA_ARGS__)
 
 /// 致命错误日志
-#define LOG_FATAL(fmt, ...) \
-    l4lb::Logger::instance().log(l4lb::LogLevel::FATAL, \
-        __FILE__, __LINE__, __func__, fmt, ##__VA_ARGS__)
+#define LOG_FATAL(fmt, ...) L4LB_LOG(l4lb::LogLevel::FATAL, fmt, ##__VA_ARGS__)
 
 /// 条件日志：满足条件时记录
 #define LOG_IF(level, cond, fmt, ...) \
     do { \
         if (cond) { \
+            L4LB_LOG(level, fmt, ##__VA_ARGS__); \
+        } \
+    } while (0)
+
+/**
+ * @brief 限速日志：同一调用点每 interval_sec 秒最多输出一次
+ *
+ * 用于数据面上可能每包触发的告警（无后端、查不到 MAC 等），
+ * 避免故障时每包加锁 fprintf 拖垮转发。
+ */
+#define LOG_RATELIMIT(level, interval_sec, fmt, ...) \
+    do { \
+        static std::atomic<int64_t> l4lb_rl_last_{0}; \
+        if (__builtin_expect(l4lb::Logger::instance().is_enabled(level), 0) && \
+            l4lb::log_ratelimit_pass(l4lb_rl_last_, (interval_sec))) { \
             l4lb::Logger::instance().log(level, \
                 __FILE__, __LINE__, __func__, fmt, ##__VA_ARGS__); \
         } \

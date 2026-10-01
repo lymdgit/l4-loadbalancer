@@ -24,8 +24,9 @@ NatForwarder::NatForwarder(uint64_t tx_offload_caps) {
   tx_offload_caps_ = tx_offload_caps;
 }
 
-bool NatForwarder::forward(uint8_t *pkt, size_t len, const PacketMeta &meta,
-                          RealServer *rs, Port nat_src_port, void *mbuf) {
+bool NatForwarder::forward(uint8_t *pkt, size_t /*len*/,
+                          const PacketMeta &meta, RealServer *rs,
+                          Port nat_src_port, void *mbuf) {
   if (!rs) {
     LOG_ERROR("NAT forward: rs is null");
     return false;
@@ -166,7 +167,7 @@ bool NatForwarder::forward(uint8_t *pkt, size_t len, const PacketMeta &meta,
   return true;
 }
 
-bool NatForwarder::forward_reply(uint8_t *pkt, size_t len,
+bool NatForwarder::forward_reply(uint8_t *pkt, size_t /*len*/,
                                 const PacketMeta &meta, const Session &session,
                                 void *mbuf) {
   auto *eth = reinterpret_cast<EthernetHeader *>(pkt);
@@ -237,8 +238,9 @@ bool NatForwarder::forward_reply(uint8_t *pkt, size_t len,
   if (ArpTable::instance().lookup(ip->dst_ip, dst_mac)) {
     eth->set_dst_mac(dst_mac);
   } else {
-    LOG_WARN("SNAT: No MAC for Client %s, using broadcast",
-             ip_to_string(ip->dst_ip).c_str());
+    LOG_RATELIMIT(l4lb::LogLevel::WARN, 1,
+                  "SNAT: No MAC for Client %s, using broadcast",
+                  ip_to_string(ip->dst_ip).c_str());
     dst_mac = Ethernet::broadcast_mac();
     eth->set_dst_mac(dst_mac);
   }

@@ -11,8 +11,12 @@
 #ifndef L4LB_DATAPLANE_CONTEXT_H
 #define L4LB_DATAPLANE_CONTEXT_H
 
+#include <array>
 #include <atomic>
 #include <cstdint>
+
+#include <rte_common.h> // RTE_CACHE_LINE_SIZE
+#include <rte_config.h> // RTE_MAX_LCORE
 
 struct rte_mempool;
 
@@ -32,7 +36,9 @@ constexpr uint16_t BURST_SIZE = 64;       // 增大批处理，提升吞吐
 // ============================================================================
 // 全局状态
 // ============================================================================
-extern volatile bool g_running;
+
+/// 运行标志：信号处理函数只写这个变量（lock-free atomic，async-signal-safe）
+extern std::atomic<bool> g_running;
 extern LoadBalancer g_lb; // 负载均衡相关配置：一致性hash
 extern uint16_t g_port_id; // 默认使用端口 0
 extern struct rte_mempool *g_mbuf_pool;
@@ -41,10 +47,21 @@ extern uint64_t g_tx_offloads_enabled;
 // 多队列配置（port_init 根据网卡能力写入实际队列数）
 extern uint16_t g_num_queues;
 
-// 统计信息 (使用 atomic 保证多核安全)
-extern std::atomic<uint64_t> g_stats_rx;
-extern std::atomic<uint64_t> g_stats_tx;
-extern std::atomic<uint64_t> g_stats_dropped;
+/// 网卡收发统计（per-lcore，只由所属 lcore 写，见 common/stats.h）
+struct alignas(RTE_CACHE_LINE_SIZE) PortLcoreStats {
+  std::atomic<uint64_t> rx{0};
+  std::atomic<uint64_t> tx{0};
+  std::atomic<uint64_t> dropped{0};
+};
+extern std::array<PortLcoreStats, RTE_MAX_LCORE> g_port_stats;
+
+/// 汇总所有 lcore 的网卡收发统计
+struct PortStatsTotal {
+  uint64_t rx = 0;
+  uint64_t tx = 0;
+  uint64_t dropped = 0;
+};
+PortStatsTotal port_stats_total();
 
 } // namespace l4lb
 

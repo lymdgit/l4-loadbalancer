@@ -5,6 +5,7 @@
 
 #include "common/logger.h"
 
+#include <chrono>
 #include <cstdarg>
 #include <cstdio>
 #include <ctime>
@@ -13,17 +14,17 @@ namespace l4lb {
 
 void Logger::set_level(const std::string &level_str) {
   if (level_str == "debug")
-    level_ = LogLevel::DEBUG;
+    set_level(LogLevel::DEBUG);
   else if (level_str == "info")
-    level_ = LogLevel::INFO;
+    set_level(LogLevel::INFO);
   else if (level_str == "warn")
-    level_ = LogLevel::WARN;
+    set_level(LogLevel::WARN);
   else if (level_str == "error")
-    level_ = LogLevel::ERROR;
+    set_level(LogLevel::ERROR);
   else if (level_str == "fatal")
-    level_ = LogLevel::FATAL;
+    set_level(LogLevel::FATAL);
   else if (level_str == "off")
-    level_ = LogLevel::OFF;
+    set_level(LogLevel::OFF);
 }
 
 void Logger::log(LogLevel level, const char *file, int line, const char *func,
@@ -85,6 +86,17 @@ const char *Logger::get_level_str(LogLevel level) {
   default:
     return "?????";
   }
+}
+
+bool log_ratelimit_pass(std::atomic<int64_t> &last, int64_t interval_sec) {
+  int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count();
+  int64_t prev = last.load(std::memory_order_relaxed);
+  if (prev != 0 && now - prev < interval_sec)
+    return false;
+  // 多核同时触发时只放行一个
+  return last.compare_exchange_strong(prev, now, std::memory_order_relaxed);
 }
 
 } // namespace l4lb

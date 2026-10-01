@@ -17,6 +17,7 @@
  * @author L4 Load Balancer Project
  */
 
+#include <atomic>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -46,11 +47,17 @@ using namespace l4lb;
 // ============================================================================
 // 信号处理
 // ============================================================================
+// 只做 async-signal-safe 的事：写一个 lock-free atomic 标志。
+// 日志（加锁 + fprintf）放到主流程里打印。
+static volatile sig_atomic_t g_signal_received = 0;
+
 static void signal_handler(int sig) {
-  (void)sig;
-  LOG_INFO("Received signal %d, shutting down...", sig);
-  g_running = false;
+  g_signal_received = sig;
+  g_running.store(false, std::memory_order_relaxed);
 }
+
+static_assert(std::atomic<bool>::is_always_lock_free,
+              "g_running must be lock-free to be written from a signal handler");
 
 // ============================================================================
 // 主函数
@@ -164,6 +171,18 @@ int main(int argc, char *argv[]) {
   }
   LOG_INFO("Port %u initialized with %u queues", g_port_id, g_num_queues);
 
+  // 每个 lcore 必须独占一组 RX/TX 队列：rte_eth_rx_burst / tx_burst 对同一个
+  // 队列不是线程安全的。网卡队列不够时直接报错，让用户减少 -l 指定的核数。
+  if (g_num_queues < num_lcores) {
+    LOG_FATAL("NIC supports only %u queues but %u lcores were given; "
+              "use at most %u lcores (EAL -l option)",
+              g_num_queues, num_lcores, g_num_queues);
+    rte_eth_dev_stop(g_port_id);
+    rte_eth_dev_close(g_port_id);
+    rte_eal_cleanup();
+    return 1;
+  }
+
   // 初始化 SessionManager 反向哈希表（必须在 EAL 之后，LoadBalancer 之前）
   if (!SessionManager::instance().init()) {
     LOG_FATAL("Failed to initialize SessionManager reverse hash table");
@@ -210,30 +229,32 @@ int main(int argc, char *argv[]) {
   LOG_INFO("========================================================");
 
   // 启动多核 worker
-  // 为每个 lcore 分配 queue_id
+  // 为每个 lcore 分配独占的 queue_id（上面已保证 g_num_queues >= lcore 数）
   static uint16_t queue_ids[RTE_MAX_LCORE];
   uint16_t queue_id = 0;
   unsigned lcore_id;
 
   // 在所有 worker lcore 上启动 worker_loop
   RTE_LCORE_FOREACH_WORKER(lcore_id) {
-    if (queue_id < g_num_queues) {
-      queue_ids[lcore_id] = queue_id;
-      LOG_INFO("Launching worker on lcore %u, queue %u", lcore_id, queue_id);
-      rte_eal_remote_launch(worker_loop, &queue_ids[lcore_id], lcore_id);
-      ++queue_id;
-    }
+    queue_ids[lcore_id] = queue_id;
+    LOG_INFO("Launching worker on lcore %u, queue %u", lcore_id, queue_id);
+    rte_eal_remote_launch(worker_loop, &queue_ids[lcore_id], lcore_id);
+    ++queue_id;
   }
 
-  // master lcore 也运行一个 worker (使用剩余的队列，或者队列 0)
-  uint16_t master_queue = (queue_id < g_num_queues) ? queue_id : 0;
+  // master lcore 也运行一个 worker，使用最后一个队列
+  uint16_t master_queue = queue_id;
   queue_ids[rte_get_main_lcore()] = master_queue;
   LOG_INFO("Master lcore %u running on queue %u", rte_get_main_lcore(),
            master_queue);
   worker_loop(&queue_ids[rte_get_main_lcore()]);
 
-  // 等待所有 worker 结束
+  // 等待所有 worker 结束（worker 退出前已从 RCU 注销）
   rte_eal_mp_wait_lcore();
+  if (g_signal_received) {
+    LOG_INFO("Received signal %d, shutting down...",
+             static_cast<int>(g_signal_received));
+  }
 
   // 清理
   g_lb.stop();
@@ -248,9 +269,17 @@ int main(int argc, char *argv[]) {
   auto final_stats = g_lb.get_stats();
   auto final_sess = SessionManager::instance().get_stats();
   LOG_INFO("Final Statistics:");
-  LOG_INFO("  DPDK RX: %lu, TX: %lu", g_stats_rx.load(), g_stats_tx.load());
-  LOG_INFO("  LB Forwarded: %lu", final_stats.forwarded_packets);
-  LOG_INFO("  Total Sessions: %lu", final_sess.total_sessions);
+  auto port_total = port_stats_total();
+  LOG_INFO("  DPDK RX: %lu, TX: %lu", port_total.rx, port_total.tx);
+  auto final_dbg = SessionManager::instance().get_debug_stats();
+  LOG_INFO("  DPDK Dropped: %lu", port_total.dropped);
+  LOG_INFO("  LB Forwarded: %lu, Dropped: %lu", final_stats.forwarded_packets,
+           final_stats.dropped_packets);
+  LOG_INFO("  Total Sessions: %lu, Active: %lu", final_sess.total_sessions,
+           final_sess.active_sessions);
+  LOG_INFO("  Session create fail: %lu, replaced: %lu, cleaned: %lu",
+           final_dbg.create_fail, final_dbg.replaced,
+           final_dbg.cleanup_removed);
   LOG_INFO("========================================================");
 
   rte_eal_cleanup();

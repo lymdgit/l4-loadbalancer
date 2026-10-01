@@ -14,10 +14,9 @@ namespace l4lb {
 
 DrForwarder::DrForwarder() { local_mac_ = Config::instance().get_vip_mac(); }
 
-bool DrForwarder::forward(uint8_t *pkt, size_t len, const PacketMeta &meta,
-                          RealServer *rs, Port nat_src_port, void *mbuf) {
-  (void)nat_src_port;
-  (void)mbuf;
+bool DrForwarder::forward(uint8_t *pkt, size_t /*len*/,
+                          const PacketMeta & /*meta*/, RealServer *rs,
+                          Port /*nat_src_port*/, void * /*mbuf*/) {
   if (!rs)
     return false;
 
@@ -41,8 +40,9 @@ bool DrForwarder::forward(uint8_t *pkt, size_t len, const PacketMeta &meta,
     if (ArpTable::instance().lookup(rs->ip, dst_mac)) {
       eth->set_dst_mac(dst_mac);
     } else {
-      LOG_WARN("No MAC for RS %s (config and ARP both empty)",
-               ip_to_string(rs->ip).c_str());
+      LOG_RATELIMIT(l4lb::LogLevel::WARN, 1,
+                    "No MAC for RS %s (config and ARP both empty)",
+                    ip_to_string(rs->ip).c_str());
       return false;
     }
   }
@@ -55,10 +55,9 @@ bool DrForwarder::forward(uint8_t *pkt, size_t len, const PacketMeta &meta,
   return true;
 }
 
-bool DrForwarder::forward_reply(uint8_t *pkt, size_t len,
-                                const PacketMeta &meta, const Session &session,
-                                void *mbuf) {
-  (void)mbuf;
+bool DrForwarder::forward_reply(uint8_t * /*pkt*/, size_t /*len*/,
+                                const PacketMeta & /*meta*/,
+                                const Session & /*session*/, void * /*mbuf*/) {
   // DR 模式下，返回流量直接从 RS 到客户端，不经过 LB
   return false;
 }
