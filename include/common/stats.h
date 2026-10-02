@@ -3,10 +3,10 @@
  * @brief per-lcore 统计计数器
  *
  * 数据面计数器的写法约定：
- * - 每个 lcore 只写自己的那一份，按 cache line 对齐，避免伪共享
+ * - 每个 worker 只写自己的那一份，按 cache line 对齐，避免伪共享
  * - 计数器是 std::atomic，但只用 relaxed 的 load + store（不用 fetch_add），
  *   在 x86 上编译成普通的 mov，没有 lock 前缀
- * - 读取方（统计打印）跨核汇总，relaxed load 保证读到的是完整的 64 位值
+ * - 读取方（统计打印、控制面）跨核汇总，relaxed load 保证读到完整的 64 位值
  *
  * @author L4 Load Balancer Project
  */
@@ -14,15 +14,15 @@
 #ifndef L4LB_COMMON_STATS_H
 #define L4LB_COMMON_STATS_H
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 
 #include <rte_common.h> // RTE_CACHE_LINE_SIZE
-#include <rte_lcore.h>
 
 namespace l4lb {
 
-/// per-lcore 计数器：只能由所属 lcore 调用
+/// 计数器：只能由所属 lcore 调用
 inline void stat_add(std::atomic<uint64_t> &c, uint64_t n = 1) {
   c.store(c.load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
 }
@@ -31,11 +31,68 @@ inline uint64_t stat_get(const std::atomic<uint64_t> &c) {
   return c.load(std::memory_order_relaxed);
 }
 
-/// 当前线程对应的 per-lcore 下标；非 EAL 线程统一落到 0
-inline unsigned stat_lcore() {
-  unsigned lcore = rte_lcore_id();
-  return lcore < RTE_MAX_LCORE ? lcore : 0;
-}
+/// worker 计数器 ID；名字表见 stat_name()
+enum Stat : uint32_t {
+  // 网卡
+  ST_RX,
+  ST_TX,
+  ST_TX_FULL,      ///< TX 队列满丢弃
+  // 分类
+  ST_ARP,
+  ST_ICMP,
+  ST_TCP,
+  ST_UDP,
+  // 转发
+  ST_FWD_IN,       ///< Client -> RS
+  ST_FWD_OUT,      ///< RS -> Client（FULLNAT）
+  ST_ICMP_ERR_FWD, ///< 转发的 ICMP 差错
+  // 丢弃原因
+  ST_DROP_MALFORMED,
+  ST_DROP_FRAGMENT,
+  ST_DROP_CKSUM,      ///< 网卡报告校验和错误
+  ST_DROP_NOT_LOCAL,  ///< 目的地址不是本机
+  ST_DROP_NO_SERVICE, ///< VIP 上没有这个端口/协议
+  ST_DROP_NO_SESSION, ///< 非 SYN 且无会话 / 回程无会话
+  ST_DROP_NO_RS,      ///< 没有可用 RS
+  ST_DROP_RS_DOWN,    ///< 会话的 RS 已下线
+  ST_DROP_TABLE_FULL, ///< 会话表满
+  ST_DROP_NO_PORT,    ///< SNAT 端口耗尽
+  ST_DROP_NO_NEIGH,   ///< 下一跳 MAC 未解析
+  ST_DROP_TTL,
+  ST_DROP_REDIRECT,   ///< 转交其他 worker 时 ring 满
+  ST_DROP_OTHER,
+  // 会话
+  ST_SESS_NEW,
+  ST_SESS_EXPIRED,
+  ST_SESS_CLOSED,     ///< RST/RS 下线等主动结束
+  // 多核分发
+  ST_REDIRECT_OUT,    ///< 本核收到、转交给 owner
+  ST_REDIRECT_IN,     ///< 从其他核转交来
+  ST_RSS_MISMATCH,    ///< 网卡 RSS hash 与软件计算不一致（自检）
+  // FULLNAT 选项处理
+  ST_TOA_ADDED,
+  ST_TOA_NO_ROOM,
+  ST_TS_STRIPPED,
+  ST_HC_RESP,         ///< 收到健康检查回包
+  ST_COUNT
+};
+
+const char *stat_name(Stat id);
+
+/// 一个 worker 的全部计数器
+struct alignas(RTE_CACHE_LINE_SIZE) WorkerStats {
+  std::array<std::atomic<uint64_t>, ST_COUNT> c{};
+
+  void add(Stat id, uint64_t n = 1) { stat_add(c[id], n); }
+  uint64_t get(Stat id) const { return stat_get(c[id]); }
+};
+
+/// 汇总后的快照
+struct StatsTotal {
+  std::array<uint64_t, ST_COUNT> c{};
+  uint64_t operator[](Stat id) const { return c[id]; }
+  uint64_t drops() const;
+};
 
 } // namespace l4lb
 

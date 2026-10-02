@@ -284,6 +284,19 @@ def clean_shutdown():
                "no clean shutdown log:\n" + lb.log[-800:])
 
 
+def _register_feature_tests():
+    import test_features
+    for fn in test_features.ALL:
+        def wrapper(fn=fn):
+            fn(BIN)
+        wrapper.__name__ = fn.__name__
+        wrapper.__doc__ = fn.__doc__
+        TESTS.append(wrapper)
+
+
+_register_feature_tests()
+
+
 def main():
     global BIN
     args = sys.argv[1:]

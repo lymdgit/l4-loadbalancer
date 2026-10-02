@@ -1,5 +1,10 @@
 # 反向会话表性能优化：从 unordered_map + spinlock 到 rte_hash (Lock-Free)
 
+> **注意：本文描述的是重构前的设计，已过时。** 现在会话表是 per-worker 的（见
+> `include/lb/session.h`），FULLNAT 回程包由 `dataplane/steering.h` 保证回到创建会话的核，
+> 会话表不再需要跨核共享和 RCU。RCU（QSBR）现在用于配置快照（`ctrl/snapshot.h`）
+> 和邻居表（`net/neigh.h`）的无锁读。本文保留作为学习记录。
+
 ## 一、为什么反向会话表必须换成 rte_hash？
 
 ### 1. 破除数据面热路径上的动态内存分配 (malloc) 噩梦

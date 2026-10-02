@@ -33,6 +33,7 @@ struct __attribute__((packed)) IPv4Header {
     uint8_t get_ihl() const { return version_ihl & 0x0F; }
     size_t get_header_len() const { return get_ihl() * 4; }
     uint16_t get_total_length() const { return ntohs(total_length); }
+    void set_total_length(uint16_t len) { total_length = htons(len); }
     
     bool is_tcp() const { return protocol == static_cast<uint8_t>(IPProtocol::TCP); }
     bool is_udp() const { return protocol == static_cast<uint8_t>(IPProtocol::UDP); }
@@ -49,6 +50,20 @@ struct __attribute__((packed)) IPv4Header {
 };
 
 static_assert(sizeof(IPv4Header) == 20, "IPv4Header size must be 20 bytes");
+
+/// TCP 标志位
+constexpr uint8_t TCP_FIN = 0x01;
+constexpr uint8_t TCP_SYN = 0x02;
+constexpr uint8_t TCP_RST = 0x04;
+constexpr uint8_t TCP_PSH = 0x08;
+constexpr uint8_t TCP_ACK = 0x10;
+
+/// TCP 选项
+constexpr uint8_t TCPOPT_EOL = 0;
+constexpr uint8_t TCPOPT_NOP = 1;
+constexpr uint8_t TCPOPT_TIMESTAMP = 8;
+constexpr uint8_t TCPOPT_TOA = 254; ///< 与 toa.ko 约定的选项号
+constexpr uint8_t TCPOLEN_TOA = 8;  ///< kind + len + port(2) + ipv4(4)
 
 /// TCP 头结构
 struct __attribute__((packed)) TcpHeader {
@@ -67,6 +82,9 @@ struct __attribute__((packed)) TcpHeader {
     void set_src_port(uint16_t p) { src_port = htons(p); }
     void set_dst_port(uint16_t p) { dst_port = htons(p); }
     size_t get_header_len() const { return ((data_offset >> 4) & 0x0F) * 4; }
+    void set_header_len(size_t len) {
+        data_offset = static_cast<uint8_t>(((len / 4) << 4) | (data_offset & 0x0F));
+    }
 };
 
 static_assert(sizeof(TcpHeader) == 20, "TcpHeader size must be 20 bytes");

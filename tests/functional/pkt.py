@@ -44,8 +44,11 @@ def l4_csum(src, dst, proto, seg, off):
     return seg[:off] + struct.pack("!H", c) + seg[off + 2:]
 
 
-def tcp(src, dst, sp, dp, flags=SYN, seq=1000, data=b"", **ipkw):
-    seg = struct.pack("!HHIIBBHHH", sp, dp, seq, 0, 5 << 4, flags, 65535, 0, 0) + data
+def tcp(src, dst, sp, dp, flags=SYN, seq=1000, data=b"", ack=0, opts=b"", **ipkw):
+    assert len(opts) % 4 == 0
+    doff = 5 + len(opts) // 4
+    seg = struct.pack("!HHIIBBHHH", sp, dp, seq, ack, doff << 4, flags, 65535,
+                      0, 0) + opts + data
     return ipv4(src, dst, TCP, l4_csum(src, dst, TCP, seg, 16), **ipkw)
 
 
@@ -62,6 +65,28 @@ def icmp_echo(src, dst, data=b"pingdata" * 4):
 
 def eth(payload, etype=0x0800, src=CLI_MAC, dst=LB_MAC):
     return dst + src + struct.pack("!H", etype) + payload
+
+
+def arp_reply(sender_ip, sender_mac, target_ip, target_mac=LB_MAC):
+    a = struct.pack("!HHBBH6s4s6s4s", 1, 0x0800, 6, 4, 2, sender_mac,
+                    ip4(sender_ip), target_mac, ip4(target_ip))
+    return eth(a, 0x0806, src=sender_mac, dst=target_mac)
+
+
+def tcp_opts(f):
+    """Parse TCP options of a Frame into [(kind, bytes)]."""
+    out, o, i = [], f.opts, 0
+    while i < len(o):
+        k = o[i]
+        if k == 0:
+            break
+        if k == 1:
+            i += 1
+            continue
+        ln = o[i + 1]
+        out.append((k, o[i + 2:i + ln]))
+        i += ln
+    return out
 
 
 def arp_request(sender_ip, target_ip, sender_mac=CLI_MAC):
@@ -89,10 +114,18 @@ class Frame:
             self.l4 = ip[ihl:tl]
             if self.proto in (TCP, UDP):
                 self.sport, self.dport = struct.unpack("!HH", self.l4[:4])
+            if self.proto == TCP:
+                self.seq, self.ack = struct.unpack("!II", self.l4[4:12])
+                self.doff = (self.l4[12] >> 4) * 4
+                self.flags = self.l4[13]
+                self.opts = self.l4[20:self.doff]
+                self.payload = self.l4[self.doff:]
             if self.proto == ICMP:
                 self.icmp_type = self.l4[0]
         elif self.etype == 0x0806:
             self.arp_op = struct.unpack("!H", raw[20:22])[0]
+            self.arp_sender_mac = raw[22:28]
+            self.arp_sender_ip = socket.inet_ntoa(raw[28:32])
             self.arp_target_ip = socket.inet_ntoa(raw[38:42])
 
     def ip_csum_ok(self):

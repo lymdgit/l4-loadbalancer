@@ -2,17 +2,13 @@
  * @file main.cpp
  * @brief L4 负载均衡器主程序 - 纯 DPDK 实现
  *
- * 直接使用 DPDK 进行数据包处理，不依赖 F-Stack：
- * 1. 使用 DPDK 收发数据包
- * 2. 解析 IP/TCP/UDP 头部
- * 3. 使用一致性哈希选择后端
- * 4. NAT 模式修改数据包头部
- * 5. 直接转发
+ * 本文件只负责启动流程：参数解析 -> 加载配置 -> EAL / 端口 / 各模块初始化
+ * -> 启动 worker 和控制线程 -> 退出清理。
  *
- * 本文件只负责：参数解析 -> EAL/端口/模块初始化 -> 启动 worker -> 退出清理。
- * - 端口初始化：src/dataplane/port.cpp
- * - worker 循环：src/dataplane/worker.cpp
- * - 报文处理：  src/core/loadbalancer.cpp
+ *   数据面：     src/dataplane/{port,worker,steering}.cpp, src/core/processor.cpp
+ *   会话与调度： src/lb/{session,scheduler,tcp_state}.cpp
+ *   控制面：     src/ctrl/{snapshot,healthcheck,control}.cpp
+ *   邻居/路由：  src/net/neigh.cpp, include/net/route.h
  *
  * @author L4 Load Balancer Project
  */
@@ -22,33 +18,33 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <string>
 #include <vector>
 
+#include <rte_cycles.h>
 #include <rte_eal.h>
 #include <rte_errno.h>
 #include <rte_ethdev.h>
 #include <rte_lcore.h>
+#include <rte_malloc.h>
 #include <rte_mbuf.h>
 #include <rte_mempool.h>
+#include <rte_rcu_qsbr.h>
+#include "common/dpdk_ring.h"
 
 #include "common/config.h"
 #include "common/logger.h"
-#include "common/types.h"
-#include "core/loadbalancer.h"
+#include "ctrl/control.h"
 #include "dataplane/context.h"
 #include "dataplane/port.h"
 #include "dataplane/worker.h"
-#include "lb/real_server.h"
-#include "lb/session.h"
 
 using namespace l4lb;
 
 // ============================================================================
-// 信号处理
+// 信号处理：只做 async-signal-safe 的事（写 lock-free atomic 标志），日志在主流程打印
 // ============================================================================
-// 只做 async-signal-safe 的事：写一个 lock-free atomic 标志。
-// 日志（加锁 + fprintf）放到主流程里打印。
 static volatile sig_atomic_t g_signal_received = 0;
 
 static void signal_handler(int sig) {
@@ -59,230 +55,246 @@ static void signal_handler(int sig) {
 static_assert(std::atomic<bool>::is_always_lock_free,
               "g_running must be lock-free to be written from a signal handler");
 
-// ============================================================================
-// 主函数
-// ============================================================================
+static void usage(const char *prog) {
+  printf("L4 Load Balancer (Pure DPDK)\n\n"
+         "Usage: %s [DPDK EAL options] -- [LB options]\n\n"
+         "LB Options (after --):\n"
+         "  --lb-config <file>   config file (default: config/lb.conf)\n"
+         "  --log <level>        debug/info/warn/error (overrides config)\n"
+         "  --port <id>          DPDK port ID (default: 0)\n"
+         "  --check-config       validate the config file and exit\n"
+         "  --help-lb            show this help\n\n"
+         "Example:\n"
+         "  %s -l 1-4 -- --lb-config config/lb.conf\n",
+         prog, prog);
+}
+
+static int fail(const char *msg) {
+  LOG_FATAL("%s", msg);
+  rte_eal_cleanup();
+  return 1;
+}
+
 int main(int argc, char *argv[]) {
   std::string config_file = "config/lb.conf";
-  std::string log_level = "info";
+  std::string log_level;
+  long port_arg = 0;
+  bool check_only = false;
 
-  // 查找并提取 LB 特定参数
-  std::vector<char *> dpdk_argv;
-  dpdk_argv.push_back(argv[0]);
-
+  std::vector<char *> eal_argv{argv[0]};
   for (int i = 1; i < argc; ++i) {
     if (strcmp(argv[i], "--lb-config") == 0 && i + 1 < argc) {
-      config_file = argv[i + 1];
-      ++i; // 跳过下一个参数
+      config_file = argv[++i];
     } else if (strcmp(argv[i], "--log") == 0 && i + 1 < argc) {
-      log_level = argv[i + 1];
-      ++i;
+      log_level = argv[++i];
     } else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
-      g_port_id = static_cast<uint16_t>(atoi(argv[i + 1]));
-      ++i;
+      char *end = nullptr;
+      port_arg = strtol(argv[++i], &end, 10);
+      if (*end || port_arg < 0 || port_arg >= RTE_MAX_ETHPORTS) {
+        fprintf(stderr, "invalid --port %s\n", argv[i]);
+        return 1;
+      }
+    } else if (strcmp(argv[i], "--check-config") == 0) {
+      check_only = true;
     } else if (strcmp(argv[i], "--help-lb") == 0) {
-      printf("L4 Load Balancer (Pure DPDK) - High Performance L4 LB\n");
-      printf("=====================================================\n\n");
-      printf("Usage: %s [DPDK EAL options] -- [LB options]\n\n", argv[0]);
-      printf("LB Options (after --):\n");
-      printf("  --lb-config <file>   Load balancer config file (default: "
-             "config/lb.conf)\n");
-      printf("  --log <level>        Log level: debug/info/warn/error "
-             "(default: info)\n");
-      printf("  --port <id>          DPDK port ID to use (default: 0)\n");
-      printf("  --help-lb            Show this help\n\n");
-      printf("Example:\n");
-      printf("  %s -l 0-1 -n 4 -- --lb-config config/lb.conf --log info\n\n",
-             argv[0]);
+      usage(argv[0]);
       return 0;
     } else {
-      // DPDK 参数
-      dpdk_argv.push_back(argv[i]);
+      eal_argv.push_back(argv[i]);
     }
   }
 
-  // 设置日志级别
-  Logger::instance().set_level(log_level);
-
-  // 注册信号处理
   signal(SIGINT, signal_handler);
   signal(SIGTERM, signal_handler);
 
-  LOG_INFO("========================================================");
-  LOG_INFO("   L4 Load Balancer (Pure DPDK) Starting...");
-  LOG_INFO("========================================================");
-  LOG_INFO("Config: %s", config_file.c_str());
-  LOG_INFO("Mode: TRUE L4 (NAT packet forwarding, no TCP stack)");
-  LOG_INFO("========================================================");
+  // ---- 配置（在 EAL 之前加载，配置错误时不必占用网卡和大页）----
+  auto &config = Config::instance();
+  if (!config.load(config_file)) {
+    LOG_FATAL("Invalid config %s", config_file.c_str());
+    return 1;
+  }
+  g_dp.cfg = config.lb();
+  Logger::instance().set_level(log_level.empty() ? g_dp.cfg.log_level
+                                                 : log_level);
+  config.dump();
+  if (check_only) {
+    printf("config %s OK\n", config_file.c_str());
+    return 0;
+  }
 
-  // 初始化 DPDK EAL
-  LOG_INFO("Initializing DPDK EAL...");
-  int ret = rte_eal_init(static_cast<int>(dpdk_argv.size()), dpdk_argv.data());
+  // ---- EAL ----
+  int ret = rte_eal_init(static_cast<int>(eal_argv.size()), eal_argv.data());
   if (ret < 0) {
-    LOG_FATAL("Failed to initialize DPDK EAL: %s", rte_strerror(-ret));
+    LOG_FATAL("Failed to initialize DPDK EAL: %s", rte_strerror(rte_errno));
     return 1;
   }
-  LOG_INFO("DPDK EAL initialized");
+  g_dp.tsc_hz = rte_get_tsc_hz();
+  g_dp.start_tsc = rte_get_tsc_cycles();
+  g_dp.port_id = static_cast<uint16_t>(port_arg);
+  if (!rte_eth_dev_is_valid_port(g_dp.port_id))
+    return fail("DPDK port not available (bind a NIC first, see "
+                "scripts/setup_dpdk_env.sh)");
+  g_dp.socket_id = rte_eth_dev_socket_id(g_dp.port_id);
+  if (g_dp.socket_id < 0)
+    g_dp.socket_id = static_cast<int>(rte_socket_id());
 
-  // 检查可用端口
-  uint16_t nb_ports = rte_eth_dev_count_avail();
-  if (nb_ports == 0) {
-    LOG_FATAL("No Ethernet ports available");
-    rte_eal_cleanup();
-    return 1;
-  }
-  LOG_INFO("Found %u available ports", nb_ports);
+  const uint16_t num_lcores = static_cast<uint16_t>(rte_lcore_count());
 
-  if (g_port_id >= nb_ports) {
-    LOG_FATAL("Port %u not available (max: %u)", g_port_id, nb_ports - 1);
-    rte_eal_cleanup();
-    return 1;
-  }
+  // ---- mbuf 池：按队列描述符、转交 ring 和 lcore 缓存计算 ----
+  unsigned nb_mbufs = num_lcores * (RX_RING_SIZE + TX_RING_SIZE +
+                                    REDIRECT_RING_SIZE + BURST_SIZE * 2) +
+                      num_lcores * MBUF_CACHE_SIZE * 2 + 4096;
+  g_dp.pool = rte_pktmbuf_pool_create("MBUF_POOL", nb_mbufs, MBUF_CACHE_SIZE, 0,
+                                      RTE_MBUF_DEFAULT_BUF_SIZE, g_dp.socket_id);
+  if (!g_dp.pool)
+    return fail("Failed to create mbuf pool");
+  LOG_INFO("mbuf pool: %u mbufs on socket %d", nb_mbufs, g_dp.socket_id);
 
-  // 创建 mbuf 内存池
-  LOG_INFO("Creating mbuf pool...");
-  // 对这个内存池创建函数进行详细说明
-  // @param 1 : 内存池的名称
-  // @param 2 : 池中mbuf的总数
-  // @param 3 : 每个核心的本地缓存数量
-  // @param 4 : 每个mbuf私有区的长度
-  // @param 5 : 单个mbuf数据区的大小，默认大小为2048 + 预留头部
-  // @param 6 : cpu和内存绑定同一个节点，防止NUMA
-  g_mbuf_pool =
-      rte_pktmbuf_pool_create("MBUF_POOL", NUM_MBUFS, MBUF_CACHE_SIZE, 0,
-                              RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
-  if (g_mbuf_pool == nullptr) {
-    LOG_FATAL("Failed to create mbuf pool: %s", rte_strerror(rte_errno));
-    rte_eal_cleanup();
-    return 1;
-  }
-
-  // 获取可用的 lcore 数量，作为队列数量
-  uint16_t num_lcores = rte_lcore_count();
-  LOG_INFO("Detected %u lcores, will use RSS with %u queues", num_lcores,
-           num_lcores);
-
-  // 初始化端口 (使用 lcore 数量作为队列数)
-  LOG_INFO("Initializing port %u with %u queues...", g_port_id, num_lcores);
-  if (port_init(g_port_id, g_mbuf_pool, num_lcores) != 0) {
-    LOG_FATAL("Failed to initialize port %u", g_port_id);
-    rte_eal_cleanup();
-    return 1;
-  }
-  LOG_INFO("Port %u initialized with %u queues", g_port_id, g_num_queues);
-
-  // 每个 lcore 必须独占一组 RX/TX 队列：rte_eth_rx_burst / tx_burst 对同一个
-  // 队列不是线程安全的。网卡队列不够时直接报错，让用户减少 -l 指定的核数。
-  if (g_num_queues < num_lcores) {
+  // ---- 端口 + steering ----
+  PortSetup ps;
+  if (port_init(g_dp.port_id, g_dp.pool, num_lcores,
+                g_dp.cfg.force_sw_steering, g_dp.steering, ps) != 0)
+    return fail("Failed to initialize port");
+  // 每个 lcore 必须独占一组 RX/TX 队列：rx_burst / tx_burst 对同一队列不是线程安全的
+  if (ps.num_queues < num_lcores) {
     LOG_FATAL("NIC supports only %u queues but %u lcores were given; "
               "use at most %u lcores (EAL -l option)",
-              g_num_queues, num_lcores, g_num_queues);
-    rte_eth_dev_stop(g_port_id);
-    rte_eth_dev_close(g_port_id);
+              ps.num_queues, num_lcores, ps.num_queues);
+    rte_eth_dev_stop(g_dp.port_id);
+    rte_eth_dev_close(g_dp.port_id);
     rte_eal_cleanup();
     return 1;
   }
-
-  // 初始化 SessionManager 反向哈希表（必须在 EAL 之后，LoadBalancer 之前）
-  if (!SessionManager::instance().init()) {
-    LOG_FATAL("Failed to initialize SessionManager reverse hash table");
-    rte_eal_cleanup();
-    return 1;
-  }
-  LOG_INFO(
-      "TX offloads enabled: 0x%lx (HW IP=%s, HW TCP=%s, HW UDP=%s)",
-      g_tx_offloads_enabled,
-      (g_tx_offloads_enabled & RTE_ETH_TX_OFFLOAD_IPV4_CKSUM) ? "on" : "off",
-      (g_tx_offloads_enabled & RTE_ETH_TX_OFFLOAD_TCP_CKSUM) ? "on" : "off",
-      (g_tx_offloads_enabled & RTE_ETH_TX_OFFLOAD_UDP_CKSUM) ? "on" : "off");
-
-  // 初始化负载均衡器
-  LOG_INFO("Initializing Load Balancer...");
-  g_lb.set_tx_offload_caps(g_tx_offloads_enabled);
-  if (!g_lb.init(config_file)) {
-    LOG_FATAL("Failed to initialize Load Balancer");
-    rte_eal_cleanup();
-    return 1;
+  g_dp.tx_offloads = ps.tx_offloads;
+  g_dp.mtu = ps.mtu;
+  g_dp.local_mac = ps.mac;
+  if (!mac_is_zero(g_dp.cfg.vip_mac) && g_dp.cfg.vip_mac != ps.mac) {
+    LOG_WARN("configured vip_mac %s differs from NIC MAC %s; using the "
+             "configured one",
+             mac_to_string(g_dp.cfg.vip_mac).c_str(),
+             mac_to_string(ps.mac).c_str());
+    g_dp.local_mac = g_dp.cfg.vip_mac;
   }
 
-  // 打印后端服务器信息
-  auto &rs_mgr = RealServerManager::instance();
-  LOG_INFO("Backend servers:");
-  auto all_servers = rs_mgr.get_all_servers();
-  for (const auto &rs : all_servers) {
-    LOG_INFO("  [%u] %s:%u weight=%u mac=%s", rs.id,
-             ip_to_string(rs.ip).c_str(), rs.port, rs.weight,
-             mac_to_string(rs.mac).c_str());
+  // ---- RCU / 路由 / 邻居表 / 快照 ----
+  size_t qsz = rte_rcu_qsbr_get_memsize(RTE_MAX_LCORE);
+  g_dp.qsbr = static_cast<struct rte_rcu_qsbr *>(
+      rte_zmalloc("qsbr", qsz, RTE_CACHE_LINE_SIZE));
+  if (!g_dp.qsbr || rte_rcu_qsbr_init(g_dp.qsbr, RTE_MAX_LCORE) != 0)
+    return fail("Failed to init RCU");
+
+  IPv4Addr route_src = !g_dp.cfg.local_ips.empty() ? g_dp.cfg.local_ips[0]
+                                                   : g_dp.cfg.services[0].vip;
+  g_dp.route.init(route_src, g_dp.cfg.netmask, g_dp.cfg.gateway);
+
+  if (!g_dp.neigh.init(g_dp.qsbr, g_dp.socket_id))
+    return fail("Failed to init neighbor table");
+  for (const auto &svc : g_dp.cfg.services)
+    for (const auto &rs : svc.rs)
+      if (!mac_is_zero(rs.mac))
+        g_dp.neigh.add_static(rs.ip, rs.mac);
+
+  g_dp.master_ring = l4lb_ring_create_elem(
+      "master_ev", sizeof(MasterEvent), MASTER_RING_SIZE, g_dp.socket_id,
+      RING_F_SC_DEQ);
+  g_dp.health_ring = l4lb_ring_create_elem(
+      "health_ev", sizeof(HealthEvent), 1024, g_dp.socket_id,
+      RING_F_SP_ENQ | RING_F_SC_DEQ);
+  if (!g_dp.master_ring || !g_dp.health_ring)
+    return fail("Failed to create rings");
+
+  g_dp.snapshots.init(g_dp.cfg, g_dp.qsbr);
+
+  // ---- worker 上下文：worker 下标 = 队列号，main lcore 为 worker 0（master）----
+  g_dp.num_workers = num_lcores;
+  uint32_t per_worker = g_dp.cfg.max_sessions / num_lcores;
+  if (per_worker < 1024)
+    per_worker = 1024;
+  std::vector<unsigned> lcores{rte_get_main_lcore()};
+  unsigned lc;
+  RTE_LCORE_FOREACH_WORKER(lc) { lcores.push_back(lc); }
+  for (uint16_t i = 0; i < num_lcores; ++i) {
+    void *mem = rte_zmalloc_socket("worker", sizeof(WorkerCtx),
+                                   RTE_CACHE_LINE_SIZE, g_dp.socket_id);
+    if (!mem)
+      return fail("Failed to allocate worker context");
+    auto *w = new (mem) WorkerCtx();
+    w->idx = i;
+    w->lcore_id = lcores[i];
+    w->lip_cursor.assign(g_dp.cfg.local_ips.size(), 0);
+    char name[32];
+    snprintf(name, sizeof(name), "sess_%u", i);
+    if (!w->sessions.init(name, per_worker, g_dp.socket_id, 1))
+      return fail("Failed to create session table");
+    snprintf(name, sizeof(name), "redirect_%u", i);
+    w->redirect_ring = rte_ring_create(name, REDIRECT_RING_SIZE,
+                                       g_dp.socket_id, RING_F_SC_DEQ);
+    if (!w->redirect_ring)
+      return fail("Failed to create redirect ring");
+    g_dp.workers[i] = w;
   }
+  LOG_INFO("%u workers, %u sessions per worker", num_lcores, per_worker);
+
+  ControlServer ctl;
+  if (!g_dp.cfg.control_socket.empty() && !ctl.start(g_dp.cfg.control_socket))
+    LOG_WARN("control socket disabled");
 
   LOG_INFO("========================================================");
-  LOG_INFO("L4 Load Balancer is running!");
-  LOG_INFO("VIP: %s", ip_to_string(Config::instance().get_vip()).c_str());
-  LOG_INFO("Mode: %s", Config::instance().get_forward_mode() == ForwardMode::NAT
-                           ? "NAT"
-                           : "DR");
-  LOG_INFO("Using DPDK port: %u", g_port_id);
-  LOG_INFO("RSS Queues: %u (multi-core enabled)", g_num_queues);
-  LOG_INFO("NO TCP STACK - Pure packet forwarding!");
-  LOG_INFO("========================================================");
-  LOG_INFO("Press Ctrl+C to stop");
+  LOG_INFO("L4 Load Balancer is running! mode=%s",
+           g_dp.cfg.mode == ForwardMode::NAT ? "FULLNAT" : "DR");
   LOG_INFO("========================================================");
 
-  // 启动多核 worker
-  // 为每个 lcore 分配独占的 queue_id（上面已保证 g_num_queues >= lcore 数）
-  static uint16_t queue_ids[RTE_MAX_LCORE];
-  uint16_t queue_id = 0;
-  unsigned lcore_id;
-
-  // 在所有 worker lcore 上启动 worker_loop
-  RTE_LCORE_FOREACH_WORKER(lcore_id) {
-    queue_ids[lcore_id] = queue_id;
-    LOG_INFO("Launching worker on lcore %u, queue %u", lcore_id, queue_id);
-    rte_eal_remote_launch(worker_loop, &queue_ids[lcore_id], lcore_id);
-    ++queue_id;
+  for (uint16_t i = 1; i < num_lcores; ++i) {
+    LOG_INFO("Launching worker on lcore %u, queue %u", g_dp.workers[i]->lcore_id,
+             i);
+    rte_eal_remote_launch(worker_loop, g_dp.workers[i],
+                          g_dp.workers[i]->lcore_id);
   }
-
-  // master lcore 也运行一个 worker，使用最后一个队列
-  uint16_t master_queue = queue_id;
-  queue_ids[rte_get_main_lcore()] = master_queue;
-  LOG_INFO("Master lcore %u running on queue %u", rte_get_main_lcore(),
-           master_queue);
-  worker_loop(&queue_ids[rte_get_main_lcore()]);
-
-  // 等待所有 worker 结束（worker 退出前已从 RCU 注销）
+  LOG_INFO("Master lcore %u running on queue 0", g_dp.workers[0]->lcore_id);
+  worker_loop(g_dp.workers[0]);
   rte_eal_mp_wait_lcore();
-  if (g_signal_received) {
+
+  if (g_signal_received)
     LOG_INFO("Received signal %d, shutting down...",
              static_cast<int>(g_signal_received));
-  }
+  ctl.stop();
 
-  // 清理
-  g_lb.stop();
-  SessionManager::instance().cleanup();
-
-  LOG_INFO("Stopping port %u...", g_port_id);
-  rte_eth_dev_stop(g_port_id);
-  rte_eth_dev_close(g_port_id);
-
+  // ---- 退出统计 ----
+  StatsTotal t = stats_total();
   LOG_INFO("========================================================");
   LOG_INFO("L4 Load Balancer stopped");
-  auto final_stats = g_lb.get_stats();
-  auto final_sess = SessionManager::instance().get_stats();
   LOG_INFO("Final Statistics:");
-  auto port_total = port_stats_total();
-  LOG_INFO("  DPDK RX: %lu, TX: %lu", port_total.rx, port_total.tx);
-  auto final_dbg = SessionManager::instance().get_debug_stats();
-  LOG_INFO("  DPDK Dropped: %lu", port_total.dropped);
-  LOG_INFO("  LB Forwarded: %lu, Dropped: %lu", final_stats.forwarded_packets,
-           final_stats.dropped_packets);
-  LOG_INFO("  Total Sessions: %lu, Active: %lu", final_sess.total_sessions,
-           final_sess.active_sessions);
-  LOG_INFO("  Session create fail: %lu, replaced: %lu, cleaned: %lu",
-           final_dbg.create_fail, final_dbg.replaced,
-           final_dbg.cleanup_removed);
+  LOG_INFO("  DPDK RX: %lu, TX: %lu", t[ST_RX], t[ST_TX]);
+  LOG_INFO("  DPDK Dropped: %lu", t.drops());
+  LOG_INFO("  LB Forwarded: %lu, Dropped: %lu", t[ST_FWD_IN] + t[ST_FWD_OUT],
+           t.drops());
+  LOG_INFO("  Total Sessions: %lu, Active: %lu", t[ST_SESS_NEW],
+           sessions_active(t));
+  LOG_INFO("  Session create fail: %lu, replaced: 0, cleaned: %lu",
+           t[ST_DROP_TABLE_FULL] + t[ST_DROP_NO_PORT],
+           t[ST_SESS_EXPIRED] + t[ST_SESS_CLOSED]);
+  LOG_INFO("  Redirect out: %lu, RSS mismatch: %lu", t[ST_REDIRECT_OUT],
+           t[ST_RSS_MISMATCH]);
+  for (unsigned i = ST_DROP_MALFORMED; i <= ST_DROP_OTHER; ++i)
+    if (t.c[i])
+      LOG_INFO("  %s: %lu", stat_name(static_cast<Stat>(i)), t.c[i]);
   LOG_INFO("========================================================");
 
+  // ---- 清理 ----
+  for (uint16_t i = 0; i < num_lcores; ++i) {
+    WorkerCtx *w = g_dp.workers[i];
+    w->sessions.destroy();
+    rte_ring_free(w->redirect_ring);
+    w->~WorkerCtx();
+    rte_free(w);
+  }
+  g_dp.snapshots.destroy();
+  g_dp.neigh.destroy();
+  rte_eth_dev_stop(g_dp.port_id);
+  rte_eth_dev_close(g_dp.port_id);
+  rte_ring_free(g_dp.master_ring);
+  rte_ring_free(g_dp.health_ring);
+  rte_free(g_dp.qsbr);
   rte_eal_cleanup();
-
   return 0;
 }

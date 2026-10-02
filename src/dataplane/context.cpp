@@ -5,29 +5,33 @@
 
 #include "dataplane/context.h"
 
-#include "common/stats.h"
-#include "core/loadbalancer.h"
+#include "common/dpdk_ring.h"
 
 namespace l4lb {
 
+Dataplane g_dp;
 std::atomic<bool> g_running{true};
-LoadBalancer g_lb;
-uint16_t g_port_id = 0;
-struct rte_mempool *g_mbuf_pool = nullptr;
-uint64_t g_tx_offloads_enabled = 0;
 
-uint16_t g_num_queues = 1;
-
-std::array<PortLcoreStats, RTE_MAX_LCORE> g_port_stats;
-
-PortStatsTotal port_stats_total() {
-  PortStatsTotal t;
-  for (const auto &s : g_port_stats) {
-    t.rx += stat_get(s.rx);
-    t.tx += stat_get(s.tx);
-    t.dropped += stat_get(s.dropped);
+StatsTotal stats_total() {
+  StatsTotal t;
+  for (uint16_t i = 0; i < g_dp.num_workers; ++i) {
+    const WorkerCtx *w = g_dp.workers[i];
+    if (!w)
+      continue;
+    for (unsigned s = 0; s < ST_COUNT; ++s)
+      t.c[s] += w->stats.get(static_cast<Stat>(s));
   }
   return t;
+}
+
+uint64_t sessions_active(const StatsTotal &t) {
+  uint64_t gone = t[ST_SESS_EXPIRED] + t[ST_SESS_CLOSED];
+  return t[ST_SESS_NEW] > gone ? t[ST_SESS_NEW] - gone : 0;
+}
+
+void post_master_event(const MasterEvent &ev) {
+  MasterEvent copy = ev;
+  rte_ring_mp_enqueue_elem(g_dp.master_ring, &copy, sizeof(copy));
 }
 
 } // namespace l4lb

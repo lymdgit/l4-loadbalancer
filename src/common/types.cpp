@@ -5,38 +5,50 @@
 
 #include "common/types.h"
 
+#include <arpa/inet.h>
 #include <cstdio>
 
 namespace l4lb {
 
+bool parse_ipv4(const std::string &ip_str, IPv4Addr &out) {
+  struct in_addr addr;
+  // inet_pton 只接受严格的点分十进制（拒绝 999.1.1.1、前导空格等）
+  if (inet_pton(AF_INET, ip_str.c_str(), &addr) != 1)
+    return false;
+  out = addr.s_addr; // 网络字节序
+  return true;
+}
+
 IPv4Addr ip_from_string(const std::string &ip_str) {
-  uint32_t a, b, c, d;
-  if (sscanf(ip_str.c_str(), "%u.%u.%u.%u", &a, &b, &c, &d) != 4) {
-    return 0;
-  }
-  // 存储为网络字节序（大端）：第一个字节在最低地址
-  // 在小端机器上，(d << 24) | (c << 16) | (b << 8) | a 会产生网络字节序
-  return (d << 24) | (c << 16) | (b << 8) | a;
+  IPv4Addr ip = 0;
+  return parse_ipv4(ip_str, ip) ? ip : 0;
 }
 
 std::string ip_to_string(IPv4Addr ip) {
-  char buf[16];
-  // ip 是网络字节序，最低字节是第一段
-  snprintf(buf, sizeof(buf), "%u.%u.%u.%u", ip & 0xFF, (ip >> 8) & 0xFF,
-           (ip >> 16) & 0xFF, (ip >> 24) & 0xFF);
+  char buf[INET_ADDRSTRLEN];
+  struct in_addr addr;
+  addr.s_addr = ip;
+  inet_ntop(AF_INET, &addr, buf, sizeof(buf));
   return std::string(buf);
+}
+
+bool parse_mac(const std::string &mac_str, MacAddr &out) {
+  unsigned int a[6];
+  char extra;
+  if (sscanf(mac_str.c_str(), "%x:%x:%x:%x:%x:%x%c", &a[0], &a[1], &a[2],
+             &a[3], &a[4], &a[5], &extra) != 6)
+    return false;
+  for (int i = 0; i < 6; ++i) {
+    if (a[i] > 0xFF)
+      return false;
+    out[i] = static_cast<uint8_t>(a[i]);
+  }
+  return true;
 }
 
 MacAddr mac_from_string(const std::string &mac_str) {
   MacAddr mac{};
-  unsigned int a[6];
-  if (sscanf(mac_str.c_str(), "%x:%x:%x:%x:%x:%x", &a[0], &a[1], &a[2], &a[3],
-             &a[4], &a[5]) == 6) {
-    for (int i = 0; i < 6; ++i) {
-      mac[i] = static_cast<uint8_t>(a[i]);
-    }
-  }
-  return mac;
+  return parse_mac(mac_str, mac) ? mac : MacAddr{};
 }
 
 std::string mac_to_string(const MacAddr &mac) {

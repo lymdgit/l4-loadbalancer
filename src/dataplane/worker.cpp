@@ -1,213 +1,309 @@
 /**
  * @file worker.cpp
- * @brief 数据面 worker 循环实现（批量发送优化版）
+ * @brief 数据面 worker 循环与 master 周期任务
  */
 
 #include "dataplane/worker.h"
 
 #include "common/logger.h"
-#include "common/stats.h"
-#include "common/types.h"
-#include "core/loadbalancer.h"
+#include "core/processor.h"
+#include "ctrl/healthcheck.h"
 #include "dataplane/context.h"
-#include "lb/session.h"
+#include "protocol/arp.h"
+
+#include <algorithm>
+#include <sstream>
+#include <vector>
 
 #include <rte_branch_prediction.h>
 #include <rte_cycles.h>
 #include <rte_ethdev.h>
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
+#include <rte_rcu_qsbr.h>
+#include "common/dpdk_ring.h"
 
 namespace l4lb {
 
-// ============================================================================
-// 批量发送优化配置
-// ============================================================================
-#define TX_BATCH_SIZE 64 // 批量发送阈值，与 BURST_SIZE 匹配
-#define TX_DRAIN_US 50   // 缩短刷新间隔，降低延迟
-#define US_PER_S 1000000 // 每秒微秒数
+namespace {
 
-// Per-core TX buffer 结构
-struct TxBuffer {
-  struct rte_mbuf *pkts
-      [TX_BATCH_SIZE]; // 这个数组中，最多存64个mbuf的指针。这就是结构体指针数组
-  uint16_t count;
-  uint64_t last_drain_tsc;
+HealthChecker g_hc; ///< 只在 master 上使用
+
+void tx_flush(WorkerCtx &w) {
+  TxBuffer &b = w.tx;
+  if (b.count == 0)
+    return;
+  uint16_t nb = rte_eth_tx_burst(g_dp.port_id, w.idx, b.pkts, b.count);
+  w.stats.add(ST_TX, nb);
+  if (unlikely(nb < b.count)) {
+    w.stats.add(ST_TX_FULL, b.count - nb);
+    for (uint16_t i = nb; i < b.count; ++i)
+      rte_pktmbuf_free(b.pkts[i]);
+  }
+  b.count = 0;
+}
+
+void handle(WorkerCtx &w, const Snapshot &snap, struct rte_mbuf *m,
+            bool redirected) {
+  Result r = process_packet(w, snap, m, redirected);
+  switch (r.verdict) {
+  case Verdict::SEND:
+    tx_buffer_add(w, m);
+    return;
+  case Verdict::REDIRECT: {
+    WorkerCtx *to = g_dp.workers[r.target];
+    if (to && rte_ring_mp_enqueue(to->redirect_ring, m) == 0) {
+      w.stats.add(ST_REDIRECT_OUT);
+      return;
+    }
+    w.stats.add(ST_DROP_REDIRECT);
+    break;
+  }
+  case Verdict::DROP:
+    w.stats.add(r.reason);
+    break;
+  case Verdict::CONSUMED:
+    break;
+  }
+  rte_pktmbuf_free(m);
+}
+
+// ---------------------------------------------------------------------------
+// master：ARP / 邻居表
+// ---------------------------------------------------------------------------
+
+IPv4Addr arp_src_ip() {
+  const auto &c = g_dp.cfg;
+  if (!c.local_ips.empty())
+    return c.local_ips[0];
+  if (c.hc_src)
+    return c.hc_src;
+  return c.services[0].vip;
+}
+
+void send_arp(WorkerCtx &master, IPv4Addr target, bool gratuitous) {
+  struct rte_mbuf *m = rte_pktmbuf_alloc(g_dp.pool);
+  if (!m)
+    return;
+  uint8_t *buf = reinterpret_cast<uint8_t *>(
+      rte_pktmbuf_append(m, sizeof(EthernetHeader) + sizeof(ArpHeader)));
+  if (!buf) {
+    rte_pktmbuf_free(m);
+    return;
+  }
+  if (gratuitous)
+    ArpHandler::build_gratuitous(buf, target, g_dp.local_mac);
+  else
+    ArpHandler::build_request(buf, target, arp_src_ip(), g_dp.local_mac);
+  tx_buffer_add(master, m);
+}
+
+void send_garp(WorkerCtx &master, const Snapshot &snap) {
+  std::vector<IPv4Addr> addrs;
+  for (const auto &s : snap.services)
+    addrs.push_back(s.vip);
+  for (auto ip : snap.local_ips)
+    addrs.push_back(ip);
+  if (snap.hc_src)
+    addrs.push_back(snap.hc_src);
+  std::sort(addrs.begin(), addrs.end());
+  addrs.erase(std::unique(addrs.begin(), addrs.end()), addrs.end());
+  for (auto ip : addrs)
+    send_arp(master, ip, true);
+}
+
+/// 网关和没有静态 MAC 的 RS：提前解析，避免首包丢失
+void preresolve(WorkerCtx &master, const Snapshot &snap) {
+  MacAddr mac;
+  if (g_dp.route.gateway && !g_dp.neigh.lookup(g_dp.route.gateway, mac))
+    master_request_neigh(master, g_dp.route.gateway);
+  for (const auto &rs : snap.rs_pool) {
+    IPv4Addr nh = g_dp.route.next_hop(rs.ip);
+    if (mac_is_zero(rs.mac) && nh && !g_dp.neigh.lookup(nh, mac))
+      master_request_neigh(master, nh);
+  }
+}
+
+void drain_master_events(WorkerCtx &master) {
+  MasterEvent evs[64];
+  unsigned n = rte_ring_sc_dequeue_burst_elem(g_dp.master_ring, evs,
+                                              sizeof(MasterEvent), 64, nullptr);
+  for (unsigned i = 0; i < n; ++i) {
+    const MasterEvent &e = evs[i];
+    switch (e.type) {
+    case EV_ARP_FOR_US:
+      g_dp.neigh.learn(e.ip, e.mac, false, master.now_tick);
+      break;
+    case EV_ARP_REPLY:
+      g_dp.neigh.learn(e.ip, e.mac, true, master.now_tick);
+      break;
+    case EV_NEIGH_HINT:
+      g_dp.neigh.hint(e.ip, e.mac, master.now_tick);
+      break;
+    case EV_NEIGH_MISS:
+      master_request_neigh(master, e.ip);
+      break;
+    case EV_HC_RESP:
+      g_hc.on_response(master, e, master.now_ms);
+      break;
+    default:
+      break;
+    }
+  }
+}
+
+struct MasterTimers {
+  uint64_t hc_ms = 0, neigh_ms = 0, garp_ms = 0, stats_ms = 0;
+  int garp_count = 0;
 };
 
-// 刷新 TX buffer
-// 把积攒了一批的包发送出去
-static inline void tx_buffer_flush(TxBuffer *buf, uint16_t port,
-                                   uint16_t queue, PortLcoreStats &st) {
-  if (buf->count == 0)
-    return;
+void master_periodic(WorkerCtx &master, const Snapshot &snap,
+                     MasterTimers &t) {
+  uint64_t now = master.now_ms;
+  // 免费 ARP：启动后前 3 秒每秒一次（防止第一个被丢），之后每 60 秒一次
+  uint64_t garp_gap = t.garp_count < 3 ? 1000 : 60000;
+  if (t.garp_count == 0 || now - t.garp_ms >= garp_gap) {
+    send_garp(master, snap);
+    t.garp_ms = now;
+    ++t.garp_count;
+  }
+  if (now - t.hc_ms >= 100) {
+    g_hc.tick(master, snap, now);
+    t.hc_ms = now;
+  }
+  if (now - t.neigh_ms >= 1000) {
+    std::vector<IPv4Addr> refresh;
+    g_dp.neigh.age(master.now_tick, refresh);
+    for (auto ip : refresh)
+      send_arp(master, ip, false);
+    preresolve(master, snap);
+    t.neigh_ms = now;
+  }
+  if (now - t.stats_ms >= 10000) {
+    std::istringstream is(format_stats(false));
+    for (std::string line; std::getline(is, line);)
+      LOG_INFO("%s", line.c_str());
+    t.stats_ms = now;
+  }
+}
 
-  uint16_t nb_tx = rte_eth_tx_burst(port, queue, buf->pkts, buf->count);
-  // per-lcore 计数，统计发出去多少包
-  stat_add(st.tx, nb_tx);
+} // namespace
 
-  // 释放未发送的包：未能成功发送的包，直接释放掉
-  if (unlikely(nb_tx < buf->count)) {
-    stat_add(st.dropped, buf->count - nb_tx);
-    for (uint16_t i = nb_tx; i < buf->count; ++i) {
-      rte_pktmbuf_free(buf->pkts[i]);
+void tx_buffer_add(WorkerCtx &w, struct rte_mbuf *m) {
+  w.tx.pkts[w.tx.count++] = m;
+  if (w.tx.count >= BURST_SIZE)
+    tx_flush(w);
+}
+
+void master_request_neigh(WorkerCtx &master, IPv4Addr ip) {
+  if (ip && g_dp.neigh.want_request(ip, master.now_tick))
+    send_arp(master, ip, false);
+}
+
+std::string format_stats(bool verbose) {
+  StatsTotal t = stats_total();
+  std::ostringstream os;
+  os << "=== L4 LB Statistics (workers: " << g_dp.num_workers << ", steering: "
+     << (g_dp.steering.hw() ? "hw-rss" : "sw") << ") ===\n";
+  os << "DPDK RX: " << t[ST_RX] << ", TX: " << t[ST_TX]
+     << ", Dropped: " << t.drops() << "\n";
+  os << "Forwarded: in " << t[ST_FWD_IN] << ", out " << t[ST_FWD_OUT]
+     << ", icmp err " << t[ST_ICMP_ERR_FWD] << " | TCP " << t[ST_TCP]
+     << ", UDP " << t[ST_UDP] << ", ICMP " << t[ST_ICMP] << ", ARP "
+     << t[ST_ARP] << "\n";
+  os << "Sessions: active " << sessions_active(t) << ", new "
+     << t[ST_SESS_NEW] << ", expired " << t[ST_SESS_EXPIRED] << ", closed "
+     << t[ST_SESS_CLOSED] << "\n";
+  os << "Redirect: out " << t[ST_REDIRECT_OUT] << ", in "
+     << t[ST_REDIRECT_IN] << ", rss mismatch " << t[ST_RSS_MISMATCH]
+     << " | neighbors " << g_dp.neigh.count() << "\n";
+  os << "Drops:";
+  bool any = false;
+  for (unsigned i = ST_DROP_MALFORMED; i <= ST_DROP_OTHER; ++i)
+    if (t.c[i]) {
+      os << " " << stat_name(static_cast<Stat>(i)) << "=" << t.c[i];
+      any = true;
+    }
+  if (t[ST_TX_FULL])
+    os << " tx_full=" << t[ST_TX_FULL];
+  os << (any || t[ST_TX_FULL] ? "" : " none") << "\n";
+  if (verbose) {
+    for (unsigned i = 0; i < ST_COUNT; ++i)
+      os << stat_name(static_cast<Stat>(i)) << " " << t.c[i] << "\n";
+    for (uint16_t i = 0; i < g_dp.num_workers; ++i) {
+      const WorkerCtx *w = g_dp.workers[i];
+      os << "worker " << i << " lcore " << w->lcore_id << " rx "
+         << w->stats.get(ST_RX) << " tx " << w->stats.get(ST_TX)
+         << " redirect_out " << w->stats.get(ST_REDIRECT_OUT) << "\n";
     }
   }
-  buf->count = 0;
-}
-
-// 添加包到 TX buffer
-static inline void tx_buffer_add(TxBuffer *buf, struct rte_mbuf *mbuf,
-                                 uint16_t port, uint16_t queue,
-                                 PortLcoreStats &st) {
-  buf->pkts[buf->count++] = mbuf; // 把当前mbuf指针存到数组里面，等待批量发送
-
-  // Buffer 满了就发送
-  if (buf->count >= TX_BATCH_SIZE) {
-    tx_buffer_flush(buf, port, queue, st);
-  }
+  return os.str();
 }
 
 // ============================================================================
-// 处理单个数据包 (返回是否需要发送)
+// Worker 循环
 // ============================================================================
-static inline struct rte_mbuf *process_packet_batch(struct rte_mbuf *mbuf,
-                                                    PortLcoreStats &st) {
-  uint8_t *data = rte_pktmbuf_mtod(mbuf, uint8_t *);
-  size_t len = rte_pktmbuf_data_len(mbuf);
 
-  // 调用 LoadBalancer 处理
-  bool should_send = false;
-  bool handled = g_lb.process_packet(mbuf, data, len, should_send);
-
-  if (handled && should_send) {
-    return mbuf; // 返回需要发送的包
-  } else {
-    // 不发送，释放 mbuf
-    rte_pktmbuf_free(mbuf);
-    if (!handled) {
-      stat_add(st.dropped);
-    }
-    return nullptr; // 不需要发送
-  }
-}
-
-// ============================================================================
-// Worker 循环 (每个 lcore 运行一个) - 批量发送优化版
-// ============================================================================
 int worker_loop(void *arg) {
-  uint16_t queue_id = *static_cast<uint16_t *>(arg);
-  unsigned lcore_id = rte_lcore_id();
-  PortLcoreStats &port_st = g_port_stats[stat_lcore()];
-  auto &sessions = SessionManager::instance();
-
+  WorkerCtx &w = *static_cast<WorkerCtx *>(arg);
+  const bool master = w.is_master();
   struct rte_mbuf *bufs[BURST_SIZE];
-  TxBuffer tx_buf = {.pkts = {}, .count = 0, .last_drain_tsc = 0};
+  MasterTimers timers;
+  uint64_t loops = 0;
 
-  uint64_t cur_tsc = rte_get_tsc_cycles(); // 初始时读一次
-  uint64_t last_stats_time = cur_tsc;
-  uint64_t stats_interval = rte_get_tsc_hz() * 10; // 每 10 秒打印统计
-  uint64_t drain_tsc =
-      (rte_get_tsc_hz() + US_PER_S - 1) / US_PER_S * TX_DRAIN_US;
-  uint64_t local_loop_count = 0;
-  bool is_master = (lcore_id == rte_get_main_lcore());
+  if (master)
+    g_hc.init(g_dp.cfg.health, g_dp.cfg.hc_src);
 
-  LOG_INFO("Worker started on lcore %u, queue %u%s (batch TX enabled)",
-           lcore_id, queue_id, is_master ? " (master)" : "");
+  LOG_INFO("Worker %u started on lcore %u, queue %u%s", w.idx, w.lcore_id,
+           w.idx, master ? " (master)" : "");
 
-  // 注册到反向表的 RCU：之后每轮循环报告一次静默期
-  sessions.worker_online(lcore_id);
+  // 注册到 RCU：之后每轮循环报告一次静默期
+  rte_rcu_qsbr_thread_register(g_dp.qsbr, w.lcore_id);
+  rte_rcu_qsbr_thread_online(g_dp.qsbr, w.lcore_id);
 
   while (g_running.load(std::memory_order_relaxed)) {
-    // -----------------------------------------------------------------------
-    // 【热路径】核心业务：收包 + 转发，保持最高频执行，不在此处读时钟
-    // -----------------------------------------------------------------------
-    uint16_t nb_rx = rte_eth_rx_burst(g_port_id, queue_id, bufs, BURST_SIZE);
+    const Snapshot &snap = *g_dp.snapshots.current();
 
-    if (nb_rx > 0) {
-      // per-lcore 计数：统计接收到的总包数
-      stat_add(port_st.rx, nb_rx);
-
-      // 批量处理每个数据包
-      for (uint16_t i = 0; i < nb_rx; ++i) {
-        struct rte_mbuf *to_send = process_packet_batch(bufs[i], port_st);
-        if (to_send) {
-          // 内联函数，只在调用处展开，没有函数调用开销
-          tx_buffer_add(&tx_buf, to_send, g_port_id, queue_id, port_st);
-        }
-      }
-      if (tx_buf.count > 0) {
-        tx_buffer_flush(&tx_buf, g_port_id, queue_id, port_st);
-        tx_buf.last_drain_tsc = cur_tsc; // 用缓存的 cur_tsc，避免再读时钟
-      }
+    // 【热路径】收包 + 处理
+    uint16_t nb = rte_eth_rx_burst(g_dp.port_id, w.idx, bufs, BURST_SIZE);
+    if (nb) {
+      w.stats.add(ST_RX, nb);
+      for (uint16_t i = 0; i < nb; ++i)
+        handle(w, snap, bufs[i], false);
     }
+    // 其他 worker 转交来的包（会话属于本核）
+    unsigned nr = rte_ring_sc_dequeue_burst(
+        w.redirect_ring, reinterpret_cast<void **>(bufs), BURST_SIZE, nullptr);
+    if (nr) {
+      w.stats.add(ST_REDIRECT_IN, nr);
+      for (unsigned i = 0; i < nr; ++i)
+        handle(w, snap, bufs[i], true);
+    }
+    if (master)
+      drain_master_events(w);
+    tx_flush(w);
 
-    // 本轮处理完毕，不再持有任何反向表 value 指针
-    sessions.quiescent(lcore_id);
+    // 本轮处理完毕，不再持有快照、邻居表的引用
+    rte_rcu_qsbr_quiescent(g_dp.qsbr, w.lcore_id);
 
-    ++local_loop_count;
-
-    // -----------------------------------------------------------------------
-    // 【降频读表】每 1024 次循环才读一次硬件时钟（位运算，零额外开销）
-    // 彻底消灭 __rdtsc 霸屏火焰图的问题
-    // -----------------------------------------------------------------------
-    if (unlikely((local_loop_count & 1023) == 0)) {
-      cur_tsc = rte_get_tsc_cycles();
-
-      // 定期刷新 TX buffer（超时未满也发送，避免延迟积压）
-      if (tx_buf.count > 0 && (cur_tsc - tx_buf.last_drain_tsc) > drain_tsc) {
-        tx_buffer_flush(&tx_buf, g_port_id, queue_id, port_st);
-        tx_buf.last_drain_tsc = cur_tsc;
-      }
-
-      // 定期清理过期会话（每 500000 次循环 ≈ 每 512*1024 次循环检查一次）
-      if ((local_loop_count & 524287) == 0) { // 524287 = 512*1024 - 1
-        size_t cleaned = sessions.cleanup_local(cur_tsc);
-        if (cleaned > 0 && is_master) {
-          LOG_INFO("Cleaned %zu expired sessions (local)", cleaned);
-        }
-      }
-
-      // 定期打印统计信息 & 发送 ARP 探测（只有 master 执行）
-      if (is_master && cur_tsc - last_stats_time >= stats_interval) {
-        g_lb.send_arp_probes(g_port_id, queue_id, g_mbuf_pool);
-
-        auto port_total = port_stats_total();
-        auto stats = g_lb.get_stats();
-        auto sess_stats = sessions.get_stats();
-        auto sess_dbg = sessions.get_debug_stats();
-        LOG_INFO("=== L4 LB Statistics (RSS: %u queues, Batch TX) ===",
-                 g_num_queues);
-        LOG_INFO("DPDK RX: %lu, TX: %lu, Dropped: %lu", port_total.rx,
-                 port_total.tx, port_total.dropped);
-        LOG_INFO("LB RX: %lu, TX: %lu, Dropped: %lu", stats.rx_packets,
-                 stats.tx_packets, stats.dropped_packets);
-        LOG_INFO("ARP: %lu, ICMP: %lu, TCP: %lu, UDP: %lu", stats.arp_packets,
-                 stats.icmp_packets, stats.tcp_packets, stats.udp_packets);
-        LOG_INFO("Forwarded: %lu, NAT: %lu, Sessions: %lu",
-                 stats.forwarded_packets, stats.nat_translations,
-                 sess_stats.active_sessions);
-        LOG_INFO("Sess dbg: lk hit %lu miss %lu | rev hit %lu miss %lu | "
-                 "create %lu fail %lu replaced %lu | upd miss %lu | "
-                 "cleanup %lu",
-                 sess_dbg.lookup_hit, sess_dbg.lookup_miss,
-                 sess_dbg.reverse_hit, sess_dbg.reverse_miss, sess_dbg.create,
-                 sess_dbg.create_fail, sess_dbg.replaced,
-                 sess_dbg.update_miss, sess_dbg.cleanup_removed);
-        LOG_INFO("========================");
-
-        last_stats_time = cur_tsc;
+    // 【降频】每 1024 轮读一次时钟，推进时间轮，执行 master 任务
+    if (unlikely((++loops & 1023) == 0)) {
+      w.now_ms = (rte_get_tsc_cycles() - g_dp.start_tsc) * 1000 / g_dp.tsc_hz;
+      w.now_tick = 1 + w.now_ms / 1000;
+      size_t n = w.sessions.expire(w.now_tick);
+      if (n)
+        w.stats.add(ST_SESS_EXPIRED, n);
+      if (master) {
+        master_periodic(w, *g_dp.snapshots.current(), timers);
+        tx_flush(w);
       }
     }
   }
 
-  // 退出前刷新剩余的 TX buffer
-  tx_buffer_flush(&tx_buf, g_port_id, queue_id, port_st);
-
-  // 退出 RCU：之后反向表回收不再等待本 lcore
-  sessions.worker_offline(lcore_id);
-
-  LOG_INFO("Worker on lcore %u exiting", lcore_id);
+  tx_flush(w);
+  rte_rcu_qsbr_thread_offline(g_dp.qsbr, w.lcore_id);
+  rte_rcu_qsbr_thread_unregister(g_dp.qsbr, w.lcore_id);
+  LOG_INFO("Worker %u on lcore %u exiting", w.idx, w.lcore_id);
   return 0;
 }
 

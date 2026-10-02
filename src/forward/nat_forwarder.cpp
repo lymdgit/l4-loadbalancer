@@ -1,16 +1,16 @@
 /**
  * @file nat_forwarder.cpp
- * @brief NAT 转发模式实现
+ * @brief 报文改写实现
  */
 
 #include "forward/nat_forwarder.h"
 
-#include "common/config.h"
-#include "common/logger.h"
-#include "protocol/arp.h"
 #include "protocol/checksum.h"
 #include "protocol/ethernet.h"
+#include "protocol/icmp.h"
 #include "protocol/ip.h"
+
+#include <cstring>
 
 #include <rte_ethdev.h>
 #include <rte_ip.h>
@@ -18,276 +18,245 @@
 
 namespace l4lb {
 
-NatForwarder::NatForwarder(uint64_t tx_offload_caps) {
-  local_mac_ = Config::instance().get_vip_mac();
-  local_ip_ = Config::instance().get_vip();
-  tx_offload_caps_ = tx_offload_caps;
+namespace {
+
+inline EthernetHeader *eth_of(struct rte_mbuf *m) {
+  return rte_pktmbuf_mtod(m, EthernetHeader *);
 }
 
-bool NatForwarder::forward(uint8_t *pkt, size_t /*len*/,
-                          const PacketMeta &meta, RealServer *rs,
-                          Port nat_src_port, void *mbuf) {
-  if (!rs) {
-    LOG_ERROR("NAT forward: rs is null");
-    return false;
-  }
+inline void ip_checksum(IPv4Header *ip) {
+  ip->checksum = 0;
+  ip->checksum = IpChecksum::calculate(reinterpret_cast<uint8_t *>(ip),
+                                       ip->get_header_len());
+}
 
-  auto *eth = reinterpret_cast<EthernetHeader *>(pkt);
-  auto *ip = reinterpret_cast<IPv4Header *>(pkt + meta.l3_offset);
-
-  // 1. 修改 IP 头部 & 更新 IP 校验和
-  // Full NAT: dst_ip (VIP->RS), src_ip (Client->VIP)
-  uint32_t old_src_ip = ip->src_ip;
-  uint32_t old_dst_ip = ip->dst_ip;
-  uint32_t new_src_ip = local_ip_;
-  uint32_t new_dst_ip = rs->ip;
-
-  ip->dst_ip = new_dst_ip;
-  ip->src_ip = new_src_ip;
-
-  // 更新 IP 校验和 (增量)
-  // 由于我们修改了两个IP，需要调用两次 update，或者合并计算
-  // IP Checksum 只覆盖 IP Header
-  ip->checksum = L4Checksum::incremental_update(
-      ip->checksum, old_src_ip >> 16, new_src_ip >> 16);
-  ip->checksum = L4Checksum::incremental_update(
-      ip->checksum, old_src_ip & 0xFFFF, new_src_ip & 0xFFFF);
-  ip->checksum = L4Checksum::incremental_update(
-      ip->checksum, old_dst_ip >> 16, new_dst_ip >> 16);
-  ip->checksum = L4Checksum::incremental_update(
-      ip->checksum, old_dst_ip & 0xFFFF, new_dst_ip & 0xFFFF);
-
-  // TTL 递减
-  if (ip->ttl <= 1) {
-    return false;
-  }
-  uint16_t old_ttl = (uint16_t)ip->ttl | ((uint16_t)ip->protocol << 8);
-  --ip->ttl;
-  uint16_t new_ttl = (uint16_t)ip->ttl | ((uint16_t)ip->protocol << 8);
-  ip->checksum =
-      L4Checksum::incremental_update(ip->checksum, old_ttl, new_ttl);
-
-  // 2. 修改端口 & 更新 L4 校验和
-  if (ip->is_tcp()) {
-    auto *tcp = reinterpret_cast<TcpHeader *>(pkt + meta.l4_offset);
-    uint16_t old_src_port = tcp->src_port;
-    uint16_t new_src_port =
-        (nat_src_port != 0) ? nat_src_port : old_src_port;
-    uint16_t old_port = tcp->dst_port;
-    uint16_t new_port = htons(rs->port);
-    tcp->dst_port = new_port;
-    tcp->src_port = new_src_port;
-
-    // 更新 TCP 校验和 (伪头部变动 + 端口变动)
-    // 伪头部变动：SrcIP, DstIP
-    L4Checksum::update_tcp_checksum_ip(tcp, old_src_ip, new_src_ip);
-    L4Checksum::update_tcp_checksum_ip(tcp, old_dst_ip, new_dst_ip);
-    // 端口变动
-    if (new_src_port != old_src_port) {
-      L4Checksum::update_tcp_checksum_port(tcp, old_src_port, new_src_port);
+/// 把 SYN 中的 TCP timestamp 选项替换为 NOP，返回是否改动
+bool strip_timestamp(TcpHeader *tcp) {
+  uint8_t *opt = reinterpret_cast<uint8_t *>(tcp) + sizeof(TcpHeader);
+  uint8_t *end = reinterpret_cast<uint8_t *>(tcp) + tcp->get_header_len();
+  bool changed = false;
+  while (opt < end) {
+    uint8_t kind = opt[0];
+    if (kind == TCPOPT_EOL)
+      break;
+    if (kind == TCPOPT_NOP) {
+      ++opt;
+      continue;
     }
-    L4Checksum::update_tcp_checksum_port(tcp, old_port, new_port);
-
-  } else if (ip->is_udp()) {
-    auto *udp = reinterpret_cast<UdpHeader *>(pkt + meta.l4_offset);
-    uint16_t old_src_port = udp->src_port;
-    uint16_t new_src_port =
-        (nat_src_port != 0) ? nat_src_port : old_src_port;
-    uint16_t old_port = udp->dst_port;
-    uint16_t new_port = htons(rs->port);
-    udp->dst_port = new_port;
-    udp->src_port = new_src_port;
-
-    // UDP 校验和 (如果启用)
-    if (udp->checksum != 0) {
-      L4Checksum::update_udp_checksum_ip(udp, old_src_ip, new_src_ip);
-      L4Checksum::update_udp_checksum_ip(udp, old_dst_ip, new_dst_ip);
-      if (new_src_port != old_src_port) {
-        L4Checksum::update_udp_checksum_port(udp, old_src_port,
-                                             new_src_port);
-      }
-      L4Checksum::update_udp_checksum_port(udp, old_port, new_port);
+    if (opt + 1 >= end || opt[1] < 2 || opt + opt[1] > end)
+      break; // 选项长度非法，不再处理
+    if (kind == TCPOPT_TIMESTAMP) {
+      memset(opt, TCPOPT_NOP, opt[1]);
+      changed = true;
     }
+    opt += opt[1];
   }
+  return changed;
+}
 
-  // 3. 修改 MAC 地址
-  MacAddr dst_mac;
-  bool mac_is_zero = (rs->mac[0] == 0 && rs->mac[1] == 0 && rs->mac[2] == 0 &&
-                      rs->mac[3] == 0);
-  if (!mac_is_zero) {
-    dst_mac = rs->mac;
-  } else if (ArpTable::instance().lookup(rs->ip, dst_mac)) {
-  } else {
-    dst_mac = Ethernet::broadcast_mac();
+/**
+ * @brief 在 TCP 基本头之后插入 8 字节 TOA 选项
+ *
+ * 要求：TCP 头加 8 字节后不超过 60 字节；IP 包加 8 字节后不超过 MTU；
+ * mbuf 是单段且有足够尾部空间。成功后更新 IP total_length、TCP doff 和 meta。
+ */
+bool insert_toa(struct rte_mbuf *m, PacketMeta &meta, IPv4Addr ip, Port port,
+                uint16_t mtu) {
+  auto *base = rte_pktmbuf_mtod(m, uint8_t *);
+  auto *iph = reinterpret_cast<IPv4Header *>(base + meta.l3_offset);
+  auto *tcp = reinterpret_cast<TcpHeader *>(base + meta.l4_offset);
+  size_t doff = tcp->get_header_len();
+  size_t ip_len = iph->get_total_length();
+  if (doff + TCPOLEN_TOA > 60 || ip_len + TCPOLEN_TOA > mtu ||
+      !rte_pktmbuf_is_contiguous(m))
+    return false;
+
+  // 去掉以太网尾部填充，再在尾部追加 8 字节
+  size_t frame_len = meta.l3_offset + ip_len;
+  if (rte_pktmbuf_data_len(m) > frame_len)
+    rte_pktmbuf_trim(m, rte_pktmbuf_data_len(m) - frame_len);
+  if (!rte_pktmbuf_append(m, TCPOLEN_TOA))
+    return false;
+
+  uint8_t *opt = base + meta.l4_offset + sizeof(TcpHeader);
+  memmove(opt + TCPOLEN_TOA, opt, frame_len - (opt - base));
+  opt[0] = TCPOPT_TOA;
+  opt[1] = TCPOLEN_TOA;
+  memcpy(opt + 2, &port, 2); // 网络字节序
+  memcpy(opt + 4, &ip, 4);
+
+  tcp->set_header_len(doff + TCPOLEN_TOA);
+  iph->set_total_length(static_cast<uint16_t>(ip_len + TCPOLEN_TOA));
+  meta.total_len += TCPOLEN_TOA;
+  meta.payload_offset += TCPOLEN_TOA;
+  return true;
+}
+
+/// L4 校验和：网卡支持时只写伪首部并设置 offload 标志，否则软件全量计算
+void l4_checksum_full(struct rte_mbuf *m, IPv4Header *ip, uint8_t *l4,
+                      const PacketMeta &meta, uint64_t offloads) {
+  bool tcp = ip->is_tcp();
+#ifdef L4LB_HW_CKSUM
+  uint64_t want = tcp ? RTE_ETH_TX_OFFLOAD_TCP_CKSUM : RTE_ETH_TX_OFFLOAD_UDP_CKSUM;
+  if (offloads & want) {
+    m->l2_len = meta.l3_offset;
+    m->l3_len = ip->get_header_len();
+    m->ol_flags = RTE_MBUF_F_TX_IPV4 |
+                  (tcp ? RTE_MBUF_F_TX_TCP_CKSUM : RTE_MBUF_F_TX_UDP_CKSUM);
+    uint16_t ph = rte_ipv4_phdr_cksum(reinterpret_cast<const rte_ipv4_hdr *>(ip),
+                                      m->ol_flags);
+    if (tcp) {
+      m->l4_len = reinterpret_cast<TcpHeader *>(l4)->get_header_len();
+      reinterpret_cast<TcpHeader *>(l4)->checksum = ph;
+    } else {
+      m->l4_len = sizeof(UdpHeader);
+      reinterpret_cast<UdpHeader *>(l4)->checksum = ph;
+    }
+    return;
   }
+#else
+  (void)offloads;
+#endif
+  m->ol_flags = 0;
+  if (tcp)
+    L4Checksum::recalculate_tcp_checksum(
+        ip, reinterpret_cast<TcpHeader *>(l4),
+        ip->get_total_length() - ip->get_header_len());
+  else
+    L4Checksum::recalculate_udp_checksum(ip, reinterpret_cast<UdpHeader *>(l4));
+}
+
+} // namespace
+
+void clear_tx_offload(struct rte_mbuf *m) { m->ol_flags = 0; }
+
+void dr_rewrite(struct rte_mbuf *m, const MacAddr &src_mac,
+                const MacAddr &dst_mac) {
+  auto *eth = eth_of(m);
   eth->set_dst_mac(dst_mac);
-  eth->set_src_mac(local_mac_);
-
-#ifdef L4LB_HW_CKSUM
-  const bool hw_tcp =
-      (tx_offload_caps_ & RTE_ETH_TX_OFFLOAD_TCP_CKSUM) != 0;
-  const bool hw_udp =
-      (tx_offload_caps_ & RTE_ETH_TX_OFFLOAD_UDP_CKSUM) != 0;
-  const bool hw_ip =
-#ifdef L4LB_HW_CKSUM_IP
-      (tx_offload_caps_ & RTE_ETH_TX_OFFLOAD_IPV4_CKSUM) != 0;
-#else
-      false;
-#endif
-  // HW offload for L4 checksums (keep IP checksum software by default)
-  auto *m = reinterpret_cast<rte_mbuf *>(mbuf);
-  m->ol_flags |= RTE_MBUF_F_TX_IPV4;
-  if (hw_ip) {
-    ip->checksum = 0;
-    m->ol_flags |= RTE_MBUF_F_TX_IP_CKSUM;
-  }
-  if (ip->is_tcp()) {
-    if (hw_tcp) {
-      auto *tcp = reinterpret_cast<TcpHeader *>(pkt + meta.l4_offset);
-      tcp->checksum = rte_ipv4_phdr_cksum(
-          reinterpret_cast<const rte_ipv4_hdr *>(ip),
-          RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_TCP_CKSUM);
-      m->ol_flags |= RTE_MBUF_F_TX_TCP_CKSUM;
-      m->l4_len = tcp->get_header_len();
-    }
-  } else if (ip->is_udp()) {
-    if (hw_udp) {
-      auto *udp = reinterpret_cast<UdpHeader *>(pkt + meta.l4_offset);
-      udp->checksum = rte_ipv4_phdr_cksum(
-          reinterpret_cast<const rte_ipv4_hdr *>(ip),
-          RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_UDP_CKSUM);
-      m->ol_flags |= RTE_MBUF_F_TX_UDP_CKSUM;
-      m->l4_len = sizeof(UdpHeader);
-    }
-  }
-  m->l2_len = meta.l3_offset;
-  m->l3_len = ip->get_header_len();
-#endif
-
-  return true;
+  eth->set_src_mac(src_mac);
+  m->ol_flags = 0;
 }
 
-bool NatForwarder::forward_reply(uint8_t *pkt, size_t /*len*/,
-                                const PacketMeta &meta, const Session &session,
-                                void *mbuf) {
-  auto *eth = reinterpret_cast<EthernetHeader *>(pkt);
-  auto *ip = reinterpret_cast<IPv4Header *>(pkt + meta.l3_offset);
+RewriteResult nat_rewrite(struct rte_mbuf *m, PacketMeta &meta,
+                          const NatRewrite &rw, const NatOptions &opt,
+                          RewriteOutcome &out) {
+  auto *base = rte_pktmbuf_mtod(m, uint8_t *);
+  auto *ip = reinterpret_cast<IPv4Header *>(base + meta.l3_offset);
+  if (ip->ttl <= 1)
+    return RewriteResult::TTL_EXCEEDED;
 
-  // SNAT: src_ip (RS->VIP), dst_ip (VIP->Client)
-  uint32_t old_src_ip = ip->src_ip;
-  uint32_t old_dst_ip = ip->dst_ip;
-  uint32_t new_src_ip = local_ip_;
-  uint32_t new_dst_ip = session.client_tuple.src_ip;
-
-  ip->src_ip = new_src_ip;
-  ip->dst_ip = new_dst_ip;
-
-  // 更新 IP 校验和 (增量)
-  ip->checksum = L4Checksum::incremental_update(
-      ip->checksum, old_src_ip >> 16, new_src_ip >> 16);
-  ip->checksum = L4Checksum::incremental_update(
-      ip->checksum, old_src_ip & 0xFFFF, new_src_ip & 0xFFFF);
-  ip->checksum = L4Checksum::incremental_update(
-      ip->checksum, old_dst_ip >> 16, new_dst_ip >> 16);
-  ip->checksum = L4Checksum::incremental_update(
-      ip->checksum, old_dst_ip & 0xFFFF, new_dst_ip & 0xFFFF);
-
-  // TTL 递减
-  if (ip->ttl > 1) {
-    uint16_t old_ttl = (uint16_t)ip->ttl | ((uint16_t)ip->protocol << 8);
-    --ip->ttl;
-    uint16_t new_ttl = (uint16_t)ip->ttl | ((uint16_t)ip->protocol << 8);
-    ip->checksum =
-        L4Checksum::incremental_update(ip->checksum, old_ttl, new_ttl);
-  }
-
-  // 修改端口 & 更新 L4 校验和
+  // 1. TCP 选项改写（改变 TCP 头内容，之后需要全量计算 L4 校验和）
+  bool l4_full = false;
   if (ip->is_tcp()) {
-    auto *tcp = reinterpret_cast<TcpHeader *>(pkt + meta.l4_offset);
-    uint16_t old_src_port = tcp->src_port;
-    uint16_t new_src_port = session.client_tuple.dst_port;
-    uint16_t old_dst_port = tcp->dst_port;
-    uint16_t new_dst_port = session.client_tuple.src_port;
-    tcp->src_port = new_src_port;
-    tcp->dst_port = new_dst_port;
-
-    L4Checksum::update_tcp_checksum_ip(tcp, old_src_ip, new_src_ip);
-    L4Checksum::update_tcp_checksum_ip(tcp, old_dst_ip, new_dst_ip);
-    L4Checksum::update_tcp_checksum_port(tcp, old_src_port, new_src_port);
-    L4Checksum::update_tcp_checksum_port(tcp, old_dst_port, new_dst_port);
-
-  } else if (ip->is_udp()) {
-    auto *udp = reinterpret_cast<UdpHeader *>(pkt + meta.l4_offset);
-    uint16_t old_src_port = udp->src_port;
-    uint16_t new_src_port = session.client_tuple.dst_port;
-    uint16_t old_dst_port = udp->dst_port;
-    uint16_t new_dst_port = session.client_tuple.src_port;
-    udp->src_port = new_src_port;
-    udp->dst_port = new_dst_port;
-
-    if (udp->checksum != 0) {
-      L4Checksum::update_udp_checksum_ip(udp, old_src_ip, new_src_ip);
-      L4Checksum::update_udp_checksum_ip(udp, old_dst_ip, new_dst_ip);
-      L4Checksum::update_udp_checksum_port(udp, old_src_port, new_src_port);
-      L4Checksum::update_udp_checksum_port(udp, old_dst_port, new_dst_port);
+    auto *tcp = reinterpret_cast<TcpHeader *>(base + meta.l4_offset);
+    if (opt.strip_ts && (tcp->flags & TCP_SYN) && strip_timestamp(tcp)) {
+      out.ts_stripped = true;
+      l4_full = true;
+    }
+    if (opt.add_toa) {
+      if (insert_toa(m, meta, opt.toa_ip, opt.toa_port, opt.mtu)) {
+        out.toa_added = true;
+        l4_full = true;
+        base = rte_pktmbuf_mtod(m, uint8_t *);
+        ip = reinterpret_cast<IPv4Header *>(base + meta.l3_offset);
+      } else {
+        out.toa_no_room = true;
+      }
     }
   }
 
-  // 修改 MAC (查 ARP)
-  MacAddr dst_mac;
-  if (ArpTable::instance().lookup(ip->dst_ip, dst_mac)) {
-    eth->set_dst_mac(dst_mac);
-  } else {
-    LOG_RATELIMIT(l4lb::LogLevel::WARN, 1,
-                  "SNAT: No MAC for Client %s, using broadcast",
-                  ip_to_string(ip->dst_ip).c_str());
-    dst_mac = Ethernet::broadcast_mac();
-    eth->set_dst_mac(dst_mac);
-  }
-  eth->set_src_mac(local_mac_);
+  // 2. IP 头：地址、TTL；IP 校验和全量计算（20 字节，比多次增量更新更简单）
+  IPv4Addr old_src = ip->src_ip, old_dst = ip->dst_ip;
+  ip->src_ip = rw.src_ip;
+  ip->dst_ip = rw.dst_ip;
+  --ip->ttl;
+  ip_checksum(ip);
 
+  // 3. L4 端口和校验和
+  uint8_t *l4 = base + meta.l4_offset;
+  bool hw = false;
 #ifdef L4LB_HW_CKSUM
-  const bool hw_tcp =
-      (tx_offload_caps_ & RTE_ETH_TX_OFFLOAD_TCP_CKSUM) != 0;
-  const bool hw_udp =
-      (tx_offload_caps_ & RTE_ETH_TX_OFFLOAD_UDP_CKSUM) != 0;
-  const bool hw_ip =
-#ifdef L4LB_HW_CKSUM_IP
-      (tx_offload_caps_ & RTE_ETH_TX_OFFLOAD_IPV4_CKSUM) != 0;
-#else
-      false;
+  hw = opt.tx_offloads & (ip->is_tcp() ? RTE_ETH_TX_OFFLOAD_TCP_CKSUM
+                                       : RTE_ETH_TX_OFFLOAD_UDP_CKSUM);
 #endif
-  // HW offload for L4 checksums (keep IP checksum software by default)
-  auto *m = reinterpret_cast<rte_mbuf *>(mbuf);
-  m->ol_flags |= RTE_MBUF_F_TX_IPV4;
-  if (hw_ip) {
-    ip->checksum = 0;
-    m->ol_flags |= RTE_MBUF_F_TX_IP_CKSUM;
-  }
   if (ip->is_tcp()) {
-    if (hw_tcp) {
-      auto *tcp = reinterpret_cast<TcpHeader *>(pkt + meta.l4_offset);
-      tcp->checksum = rte_ipv4_phdr_cksum(
-          reinterpret_cast<const rte_ipv4_hdr *>(ip),
-          RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_TCP_CKSUM);
-      m->ol_flags |= RTE_MBUF_F_TX_TCP_CKSUM;
-      m->l4_len = tcp->get_header_len();
+    auto *tcp = reinterpret_cast<TcpHeader *>(l4);
+    Port old_sp = tcp->src_port, old_dp = tcp->dst_port;
+    tcp->src_port = rw.src_port;
+    tcp->dst_port = rw.dst_port;
+    if (l4_full || hw) {
+      l4_checksum_full(m, ip, l4, meta, opt.tx_offloads);
+    } else {
+      L4Checksum::update_tcp_checksum_ip(tcp, old_src, rw.src_ip);
+      L4Checksum::update_tcp_checksum_ip(tcp, old_dst, rw.dst_ip);
+      L4Checksum::update_tcp_checksum_port(tcp, old_sp, rw.src_port);
+      L4Checksum::update_tcp_checksum_port(tcp, old_dp, rw.dst_port);
+      m->ol_flags = 0;
     }
   } else if (ip->is_udp()) {
-    if (hw_udp) {
-      auto *udp = reinterpret_cast<UdpHeader *>(pkt + meta.l4_offset);
-      udp->checksum = rte_ipv4_phdr_cksum(
-          reinterpret_cast<const rte_ipv4_hdr *>(ip),
-          RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_UDP_CKSUM);
-      m->ol_flags |= RTE_MBUF_F_TX_UDP_CKSUM;
-      m->l4_len = sizeof(UdpHeader);
+    auto *udp = reinterpret_cast<UdpHeader *>(l4);
+    Port old_sp = udp->src_port, old_dp = udp->dst_port;
+    bool had_cksum = udp->checksum != 0;
+    udp->src_port = rw.src_port;
+    udp->dst_port = rw.dst_port;
+    if (hw) {
+      l4_checksum_full(m, ip, l4, meta, opt.tx_offloads);
+    } else if (had_cksum) {
+      L4Checksum::update_udp_checksum_ip(udp, old_src, rw.src_ip);
+      L4Checksum::update_udp_checksum_ip(udp, old_dst, rw.dst_ip);
+      L4Checksum::update_udp_checksum_port(udp, old_sp, rw.src_port);
+      L4Checksum::update_udp_checksum_port(udp, old_dp, rw.dst_port);
+      m->ol_flags = 0;
+    } else {
+      m->ol_flags = 0; // 校验和为 0 表示不校验，保持为 0
     }
   }
-  m->l2_len = meta.l3_offset;
-  m->l3_len = ip->get_header_len();
-#endif
 
-  return true;
+  // 4. MAC
+  auto *eth = reinterpret_cast<EthernetHeader *>(base);
+  eth->set_dst_mac(rw.dst_mac);
+  eth->set_src_mac(rw.src_mac);
+  return RewriteResult::OK;
+}
+
+RewriteResult nat_rewrite_icmp_error(struct rte_mbuf *m, const PacketMeta &meta,
+                                     const IcmpErrorInfo &info,
+                                     IPv4Addr outer_src, IPv4Addr outer_dst,
+                                     const FiveTuple &inner,
+                                     const MacAddr &src_mac,
+                                     const MacAddr &dst_mac) {
+  auto *base = rte_pktmbuf_mtod(m, uint8_t *);
+  auto *ip = reinterpret_cast<IPv4Header *>(base + meta.l3_offset);
+  if (ip->ttl <= 1)
+    return RewriteResult::TTL_EXCEEDED;
+
+  // 内层：被引用的原始报文头（L4 校验和覆盖整个原始报文，这里只有前 8 字节，
+  // 无法重算；接收方协议栈不校验内层 L4 校验和）
+  auto *iip = reinterpret_cast<IPv4Header *>(base + info.inner_l3_offset);
+  iip->src_ip = inner.src_ip;
+  iip->dst_ip = inner.dst_ip;
+  ip_checksum(iip);
+  auto *ports = reinterpret_cast<uint16_t *>(base + info.inner_l4_offset);
+  ports[0] = inner.src_port;
+  ports[1] = inner.dst_port;
+
+  // 外层
+  ip->src_ip = outer_src;
+  ip->dst_ip = outer_dst;
+  --ip->ttl;
+  ip_checksum(ip);
+
+  auto *icmp = reinterpret_cast<IcmpHeader *>(base + meta.l4_offset);
+  icmp->checksum = 0;
+  icmp->checksum = IcmpHandler::calculate_checksum(
+      reinterpret_cast<uint8_t *>(icmp), meta.total_len - meta.l4_offset);
+
+  auto *eth = reinterpret_cast<EthernetHeader *>(base);
+  eth->set_dst_mac(dst_mac);
+  eth->set_src_mac(src_mac);
+  m->ol_flags = 0;
+  return RewriteResult::OK;
 }
 
 } // namespace l4lb

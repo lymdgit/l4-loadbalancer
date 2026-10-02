@@ -20,6 +20,18 @@ enum class ParseResult {
     FRAGMENT,  ///< IPv4 分片（暂不支持重组），必须丢弃
 };
 
+/**
+ * @brief ICMP 差错报文中内嵌的原始报文信息
+ *
+ * ICMP 差错（type 3/11/12）的载荷是触发差错的那个报文的 IP 头 + 至少 8 字节 L4 头，
+ * 正好包含端口，可以据此找到对应的会话。
+ */
+struct IcmpErrorInfo {
+    uint16_t inner_l3_offset;   ///< 内层 IP 头偏移（相对帧首）
+    uint16_t inner_l4_offset;   ///< 内层 L4 头偏移
+    FiveTuple inner;            ///< 内层报文的五元组（原始方向）
+};
+
 /// 协议解析器
 class ProtocolParser {
 public:
@@ -38,6 +50,15 @@ public:
      * @param meta [out] 解析结果
      */
     static ParseResult parse(const uint8_t* pkt, size_t len, PacketMeta& meta);
+
+    /**
+     * @brief 解析 ICMP 差错报文的内层报文头
+     *
+     * meta 必须是 parse() 成功返回的 ICMP 报文。只接受内层为 TCP/UDP、
+     * 且内层 IP 头 + 8 字节 L4 头完整的报文。
+     */
+    static bool parse_icmp_error(const uint8_t* pkt, const PacketMeta& meta,
+                                 IcmpErrorInfo& info);
 };
 
 } // namespace l4lb

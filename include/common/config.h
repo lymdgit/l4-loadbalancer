@@ -2,14 +2,18 @@
  * @file config.h
  * @brief 配置管理模块
  *
- * 负责解析和管理负载均衡器的配置信息，包括：
- * - INI 格式配置文件解析
- * - VIP 和 Real Server 配置
- * - 运行时参数配置
+ * INI 格式：
  *
- * INI 文件格式示例：
- * [section]
- * key = value
+ *   [global]       mode / log_level / max_sessions / 各状态超时 / toa ...
+ *   [network]      vip_mac / netmask / gateway / local_ips / hc_src
+ *   [healthcheck]  enabled / interval / timeout / failure_threshold / ...
+ *   [control]      socket
+ *   [service.N]    vip / port / proto / scheduler / server1 = ip:port:weight[:mac] ...
+ *
+ * 兼容旧格式：[vip] ip/ports/mac + [realserver] count/serverN，
+ * 会被转换成每个端口一个 service（TCP 和 UDP 各一个）。
+ *
+ * 加载时做完整校验，出错时报告具体的 key 并返回 false。
  *
  * @author L4 Load Balancer Project
  */
@@ -18,120 +22,133 @@
 #define L4LB_COMMON_CONFIG_H
 
 #include "common/types.h"
+#include <map>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace l4lb {
 
-/**
- * @brief Real Server 配置信息
- */
-struct RealServerConfig {
-  std::string ip;  ///< IP 地址字符串
-  uint16_t port;   ///< 端口
-  uint32_t weight; ///< 权重
-  std::string mac; ///< MAC 地址字符串
+/// SNAT 端口段（FULLNAT 的 LIP 源端口）
+constexpr uint16_t kNatPortMin = 10000;
+constexpr uint16_t kNatPortMax = 60000;
+/// 健康检查探测使用的源端口段
+constexpr uint16_t kHcPortMin = 61000;
+constexpr uint16_t kHcPortMax = 61999;
+
+/// 容量上限（控制面校验用）
+constexpr size_t kMaxServices = 64;
+constexpr size_t kMaxRsPerService = 256;
+constexpr size_t kMaxLocalIps = 64;
+
+/// 调度算法
+enum class SchedulerType { WRR, MAGLEV };
+
+/// Real Server 配置
+struct RsConf {
+  IPv4Addr ip = 0;     ///< 网络字节序
+  uint16_t port = 0;   ///< 主机字节序
+  uint32_t weight = 1; ///< 0 表示不接新连接
+  MacAddr mac{};       ///< 全 0 表示通过 ARP 解析
+};
+
+/// 一个虚拟服务：VIP:port/proto -> 一组 RS
+struct ServiceConf {
+  std::string name;
+  IPv4Addr vip = 0;       ///< 网络字节序
+  uint16_t port = 0;      ///< 主机字节序
+  uint8_t proto = 6;      ///< 6=TCP 17=UDP
+  SchedulerType sched = SchedulerType::WRR;
+  std::vector<RsConf> rs;
+};
+
+/// TCP/UDP 各状态超时（秒）
+struct TimeoutConf {
+  uint32_t tcp_syn = 10;
+  uint32_t tcp_established = 900;
+  uint32_t tcp_fin = 10;
+  uint32_t tcp_timewait = 10;
+  uint32_t tcp_close = 5;
+  uint32_t udp = 60;
+};
+
+struct HealthConf {
+  bool enabled = false;
+  uint32_t interval_ms = 5000;
+  uint32_t timeout_ms = 3000;
+  uint32_t fall = 3; ///< 连续失败多少次判定 DOWN
+  uint32_t rise = 2; ///< 连续成功多少次判定 UP
+};
+
+/// 完整的负载均衡配置
+struct LbConfig {
+  ForwardMode mode = ForwardMode::NAT;
+  std::string log_level = "info";
+  uint32_t max_sessions = 1 << 20; ///< 所有 worker 合计
+  TimeoutConf timeouts;
+  bool toa = false;                ///< FULLNAT 下插入 TOA 选项透传客户端地址
+  bool strip_tcp_timestamp = true; ///< FULLNAT 下去掉 SYN 中的 TCP timestamp
+  bool force_sw_steering = false;  ///< steering = sw：不用网卡 RSS（调试用）
+
+  MacAddr vip_mac{};               ///< 全 0 表示使用网卡 MAC
+  IPv4Addr netmask = 0;            ///< 0 表示所有地址都按直连处理
+  IPv4Addr gateway = 0;
+  std::vector<IPv4Addr> local_ips; ///< FULLNAT SNAT 源地址（LIP）
+  IPv4Addr hc_src = 0;             ///< 健康检查源地址
+
+  HealthConf health;
+  std::string control_socket = "/run/l4lb.sock";
+
+  std::vector<ServiceConf> services;
 };
 
 /**
- * @brief 配置管理类
- *
- * 单例模式实现，提供全局配置访问
- *
- * 使用方式：
- * @code
- * auto& config = Config::instance();
- * config.load("lb.conf");
- * std::string vip = config.get("vip", "ip");
- * @endcode
+ * @brief 配置管理类（只在启动和控制面使用，数据面不访问）
  */
 class Config {
 public:
-  /// 获取单例实例
   static Config &instance() {
     static Config config;
     return config;
   }
 
-  /**
-   * @brief 从文件加载配置
-   *
-   * @param filename 配置文件路径
-   * @return true 加载成功
-   */
+  /// 加载并校验配置文件；失败时已打印错误原因
   bool load(const std::string &filename);
 
-  /**
-   * @brief 获取配置项（字符串）
-   *
-   * @param section section 名称
-   * @param key 键名
-   * @param default_val 默认值
-   * @return 配置值
-   */
+  /// 解析得到的配置
+  const LbConfig &lb() const { return lb_; }
+
+  /// 原始 key（section.key）查询
   std::string get(const std::string &section, const std::string &key,
                   const std::string &default_val = "") const;
-
-  /// 获取整数配置项
-  int get_int(const std::string &section, const std::string &key,
-              int default_val = 0) const;
-
-  /// 获取布尔配置项（true/false, yes/no, 1/0, on）
-  bool get_bool(const std::string &section, const std::string &key,
-                bool default_val = false) const;
-
-  /// 获取转发模式
-  ForwardMode get_forward_mode() const;
-
-  /// 获取 VIP 地址
-  IPv4Addr get_vip() const;
-
-  /// 获取 VIP MAC 地址
-  MacAddr get_vip_mac() const;
-
-  /// 获取监听端口列表
-  std::vector<uint16_t> get_listen_ports() const;
-
-  /// 获取 Real Server 配置列表
-  const std::vector<RealServerConfig> &get_real_servers() const {
-    return real_servers_;
-  }
-
-  /// 获取网关 IP
-  IPv4Addr get_gateway() const;
-
-  /// 获取会话超时时间（秒）
-  uint32_t get_session_timeout() const;
-
-  /// 获取虚拟节点数量
-  uint32_t get_virtual_nodes() const;
 
   /// 打印配置信息
   void dump() const;
 
 private:
   Config() = default;
-
-  // 禁止拷贝
   Config(const Config &) = delete;
   Config &operator=(const Config &) = delete;
 
-  /**
-   * @brief 解析 Real Server 配置
-   *
-   * 配置格式: server1 = ip:port:weight:mac
-   */
-  void parse_real_servers();
+  bool parse_file(const std::string &filename);
+  bool build();
+  bool parse_services();
+  bool parse_legacy_services();
+  bool parse_rs(const std::string &key, const std::string &value, RsConf &rs);
+  bool validate();
 
-  /// 去除字符串首尾空白
+  bool get_u32(const std::string &section, const std::string &key,
+               uint32_t &out, uint32_t min_val, uint32_t max_val);
+  bool get_bool(const std::string &section, const std::string &key, bool &out);
+  bool get_ip(const std::string &section, const std::string &key,
+              IPv4Addr &out);
+
   static std::string trim(const std::string &str);
-
-  /// 转换为小写
   static std::string to_lower(std::string str);
+  static std::vector<std::string> split(const std::string &s, char sep);
 
-  std::unordered_map<std::string, std::string> config_map_; ///< 配置存储
-  std::vector<RealServerConfig> real_servers_; ///< Real Server 列表
+  /// section -> (key -> value)；section 名可以包含 '.'（如 service.web）
+  std::map<std::string, std::map<std::string, std::string>> sections_;
+  LbConfig lb_;
 };
 
 } // namespace l4lb

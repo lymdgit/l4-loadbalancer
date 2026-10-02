@@ -30,6 +30,7 @@ ParseResult ProtocolParser::parse(const uint8_t *pkt, size_t len,
   meta.l3_offset = Ethernet::HEADER_SIZE;
   meta.src_port = 0;
   meta.dst_port = 0;
+  meta.tcp_flags = 0;
 
   if (!eth->is_ipv4())
     return ParseResult::OK;
@@ -72,6 +73,7 @@ ParseResult ProtocolParser::parse(const uint8_t *pkt, size_t len,
       return ParseResult::MALFORMED;
     meta.src_port = tcp->src_port;
     meta.dst_port = tcp->dst_port;
+    meta.tcp_flags = tcp->flags;
     meta.payload_offset = meta.l4_offset + doff;
   } else if (ip->is_udp()) {
     if (meta.l4_offset + sizeof(UdpHeader) > end)
@@ -90,6 +92,37 @@ ParseResult ProtocolParser::parse(const uint8_t *pkt, size_t len,
 
   meta.payload_len = end - meta.payload_offset;
   return ParseResult::OK;
+}
+
+bool ProtocolParser::parse_icmp_error(const uint8_t *pkt,
+                                      const PacketMeta &meta,
+                                      IcmpErrorInfo &info) {
+  auto *icmp = reinterpret_cast<const IcmpHeader *>(pkt + meta.l4_offset);
+  if (!icmp_is_error(icmp->type))
+    return false;
+
+  size_t inner_l3 = meta.l4_offset + sizeof(IcmpHeader);
+  if (inner_l3 + sizeof(IPv4Header) > meta.total_len)
+    return false;
+  auto *ip = reinterpret_cast<const IPv4Header *>(pkt + inner_l3);
+  size_t ihl = ip->get_header_len();
+  if (ip->get_version() != 4 || ihl < sizeof(IPv4Header))
+    return false;
+  if (!ip->is_tcp() && !ip->is_udp())
+    return false;
+  // 只看首片（非首片没有端口）
+  if (ntohs(ip->flags_fragment) & kIpFragOffMask)
+    return false;
+  size_t inner_l4 = inner_l3 + ihl;
+  if (inner_l4 + 8 > meta.total_len) // RFC 792：至少带 8 字节 L4 头
+    return false;
+
+  auto *ports = reinterpret_cast<const uint16_t *>(pkt + inner_l4);
+  info.inner_l3_offset = static_cast<uint16_t>(inner_l3);
+  info.inner_l4_offset = static_cast<uint16_t>(inner_l4);
+  info.inner = FiveTuple(ip->src_ip, ip->dst_ip, ports[0], ports[1],
+                         ip->protocol);
+  return true;
 }
 
 } // namespace l4lb

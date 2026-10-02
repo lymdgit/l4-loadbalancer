@@ -1,124 +1,127 @@
 # L4 Load Balancer
 
-基于 **DPDK** 的高性能四层负载均衡器（L4），面向高并发场景下的低延迟报文转发。
+基于 **DPDK** 的四层负载均衡器，支持 FULLNAT 和 DR 两种转发模式。
 
-## 一、 项目说明
+## 一、特性
 
-本项目实现了基于 DPDK 的四层负载均衡功能。
+- **纯数据面转发**：不终止 TCP 连接，按包改写转发；Run-to-Completion，每个 lcore 独占一组 RX/TX 队列
+- **无锁多核**：会话表 per-worker（rte_hash + 预分配数组 + 时间轮），热路径无锁、无原子 RMW、无 malloc。FULLNAT 回程包通过"按 RSS 反算选择 SNAT 端口"回到创建会话的核，不依赖 rte_flow（vmxnet3 可用）；网卡无 RSS 时自动退化为软件分发 + ring 转交
+- **FULLNAT**：Local IP 池、TCP 状态机（各状态独立超时）、TOA 透传客户端地址、去除 SYN timestamp、ICMP 差错报文转换
+- **调度**：加权轮询（平滑 WRR）、Maglev 一致性哈希，按服务配置
+- **邻居与路由**：ARP 主动解析与老化、免费 ARP、直连/网关路由，下一跳 MAC 缓存在会话中
+- **健康检查**：数据面内 TCP 探测，RS 故障自动摘除、恢复后加回
+- **控制面**：unix socket 命令，运行时调整权重、排空、增删 RS；配置以 RCU 快照发布，数据面无锁读取
 
-**核心特性：**
-- 纯数据平面转发：不终止 TCP 连接，实现按包快速改写转发。
-- 多核并行：采用 Run-to-Completion 模型与 RSS 特性充分利用多核性能。
-- 双业务模式：支持 FULLNAT 和 DR（Direct Routing）两种负载均衡模式。
-- 高级特性：支持会话保持（正向/反向映射）、一致性哈希（MurmurHash3 + 虚拟节点）、零拷贝转发（mbuf 直通）、以及灵活的校验和策略。
-
-**项目目录说明：**
+## 二、目录
 
 ```text
-l4-loadbalancer_v3/
-├── CMakeLists.txt        # CMake 项目构建配置文件
-├── build/                # CMake 编译生成的构建产物目录
-├── config/               # 负载均衡器运行配置文件目录
-│   ├── lb.conf           # FULLNAT 模式配置文件（包含 VIP、RS 信息等）
-│   └── lb_dr.conf        # DR（Direct Routing）模式配置文件
-├── docs/                 # 项目核心设计文档与技术方案
-│   └── RCU.md            # RCU 机制设计与锁优化文档等
-├── include/              # 核心 C++ 头文件与模块化设计目录
-│   ├── common/           # 基础公共组件（config.h 解析器, logger.h 日志库, types.h 结构体定义）
-│   ├── core/             # 核心业务控制模块（loadbalancer.h 流量调配主逻辑）
-│   ├── forward/          # 报文转发处理器实现（nat_forwarder.h, dr_forwarder.h 等策略实现）
-│   ├── lb/               # 负载均衡算法及状态组件（consistent_hash.h 一致性哈希, session.h 会话保持与映射）
-│   └── protocol/         # 协议交互及解析层定义
-├── src/                  # 核心源代码目录
-│   └── main.cpp          # 项目主入口及基于 Run-to-Completion 模型的核心事件调度循环
-└── 学习笔记与数据文件    # 涵盖 DPDK 学习、校验处理机制梳理、网卡及测试数据说明（如 learn.md, 校验处理.md, dpdk网卡绑定.txt 等）
+CMakeLists.txt
+config/            lb.conf（FULLNAT）、lb_dr.conf（DR）
+scripts/           setup_dpdk_env.sh（大页/驱动/网卡接管）、l4lbctl.py（控制命令）
+include/ src/      一一对应：
+  common/          配置、日志、统计、公共类型
+  protocol/        协议头、解析、校验和、ARP/ICMP 报文构造
+  lb/              会话表、TCP 状态机、调度器（WRR/Maglev）
+  forward/         FULLNAT/DR 报文改写、TOA、ICMP 差错转换
+  net/             邻居表、路由
+  ctrl/            配置快照、健康检查、控制命令
+  dataplane/       端口初始化、多核分发（steering）、worker 循环
+  core/            报文分类与处理主流程
+tests/unit/        单元测试（ctest）
+tests/functional/  功能测试（veth + net_af_packet，无需真实网卡）
+tests/perf/        性能测试脚本
+docs/              设计文档、学习笔记
+项目重构.md         重构计划与完成情况
 ```
 
-## 二、 DPDK 配置方式
-
-在运行本负载均衡器前，需要先编译 DPDK 并挂载相应的网卡驱动，具体步骤如下：
+## 三、环境准备
 
 ### 1. 编译 DPDK
+
 ```bash
-# Compile DPDK 会生成对应的驱动程序，一会需要挂载
 cd dpdk/
-# igb_uio is about 5% more efficient than vfio-pci, so continue using it.
-meson -Denable_kmods=true build
-ninja -C build
-ninja -C build install
+meson setup build && ninja -C build && ninja -C build install
 ```
 
-### 2. 配置系统大页内存 (Hugepage)
+### 2. 大页、驱动、网卡接管（每次重启后执行）
 
 ```bash
-# Set hugepage (Linux only)
-# 方式一：单节点系统（1024个2MB的page，让操作系统自己去分配）
-echo 1024 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
-
-# or NUMA (Linux only)
-# 方式二：如果有多CPU多内存条
-echo 1024 > /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages
-echo 1024 > /sys/devices/system/node/node1/hugepages/hugepages-2048kB/nr_hugepages
-
-# Using Hugepage with the DPDK (Linux only)
-# 这里是为了让 dpdk 去分配和使用大页
-mkdir -p /mnt/huge
-mount -t hugetlbfs nodev /mnt/huge
+# 查看网卡和当前状态
+sudo scripts/setup_dpdk_env.sh status
+# 配置大页 + 加载驱动 + 把网卡交给 DPDK
+sudo DPDK_NIC=ens160 scripts/setup_dpdk_env.sh up
+# 还给内核
+sudo DPDK_NIC=ens160 scripts/setup_dpdk_env.sh down
+# 开机自动执行（参数写入 /etc/l4lb/dpdk-env.conf）
+sudo DPDK_NIC=ens160 scripts/setup_dpdk_env.sh install
 ```
 
-### 3. 网卡驱动解绑与挂载
-```bash
-# Offload NIC
-# 告诉内核我要准备搞驱动了，提前准备好
-modprobe uio
-# 加载用户态的驱动（为了用户态直接操作硬件），请根据实际路径确认 .ko 文件位置
-insmod /data/f-stack/dpdk/build/kernel/linux/igb_uio/igb_uio.ko
+- 驱动默认 `auto`：有 IOMMU 用 `vfio-pci`，没有（虚拟机常见）用 `uio_pci_generic`。也可以 `DPDK_DRIVER=igb_uio IGB_UIO_KO=/path/igb_uio.ko`
+- 无 IOMMU 时强行用 vfio-pci 需要 `ALLOW_NOIOMMU=1`（会关闭 DMA 隔离，只适合测试机）
+- 脚本拒绝接管带 IP 地址、承载默认路由或当前 SSH 会话的网卡，避免管理口失联
 
-# 查看当前网卡状态
-dpdk-devbind.py --status
-
-# 卸载原网卡驱动（示例中为 ens192）并绑定至 igb_uio
-ifconfig ens192 down
-./dpdk-devbind.py --bind=igb_uio ens192
-```
-
-## 三、 测试方式说明
-
-本项目支持 FULLNAT 和 DR 两种模式，可使用对应配置文件启动应用：
+### 3. 编译
 
 ```bash
-# FULLNAT 模式启动
-./l4lb -l 1-4 -n 4 -- --lb-config ../config/lb.conf
-
-# DR 模式启动
-./l4lb -l 1-4 -n 4 -- --lb-config ../config/lb_dr.conf
+PKG_CONFIG_PATH=<dpdk-install>/lib64/pkgconfig cmake -S . -B build
+cmake --build build -j
+ctest --test-dir build          # 单元测试（cmake >= 3.20；旧版本 cd build && ctest）
 ```
 
-> **⚠️ 注意：DR 模式的特殊配置**
-> 在 DR 模式下，因为 L4 均衡器不会去修改报文的 VIP，所以需要我们在后端真实服务器 (Real Server, RS) 进行如下操作：
+CMake 选项：`-DL4LB_NATIVE=OFF`（不用 -march=native）、`-DL4LB_SANITIZE=ON`（ASan + UBSan）、`-DBUILD_TESTS=OFF`。
+
+## 四、运行
 
 ```bash
-# 1. 在回环网卡 (loopback) 上添加 VIP
-sudo ip addr add 192.168.154.132/32 dev lo
-
-# 2. 禁止 RS 响应 VIP 的 ARP 请求（避免同网络下 ARP 冲突）
-sudo sysctl -w net.ipv4.conf.all.arp_ignore=1
-sudo sysctl -w net.ipv4.conf.all.arp_announce=2
-sudo sysctl -w net.ipv4.conf.lo.arp_ignore=1
-sudo sysctl -w net.ipv4.conf.lo.arp_announce=2
-
-# 3. 验证配置是否成功生效
-ip addr show lo
+# 先检查配置
+./build/l4lb -- --lb-config config/lb.conf --check-config
+# 4 个 lcore（网卡队列数必须 >= lcore 数）
+sudo ./build/l4lb -l 1-4 -- --lb-config config/lb.conf
 ```
 
-## 四、 性能测试结果对比
+配置格式见 `config/lb.conf` 中的注释；旧格式（`[vip]` + `[realserver]`）仍然兼容。
 
-各场景下的核心性能指标（平均延迟、QPS）对比如下：
+### DR 模式的 RS 配置
 
-| 测试场景 | QPS (Req/Sec) | 平均延迟 (Avg Latency) |
+DR 只改写目的 MAC，RS 直接回包，RS 上需要：
+
+```bash
+sudo ip addr add <VIP>/32 dev lo
+sudo sysctl -w net.ipv4.conf.all.arp_ignore=1 net.ipv4.conf.all.arp_announce=2
+sudo sysctl -w net.ipv4.conf.lo.arp_ignore=1 net.ipv4.conf.lo.arp_announce=2
+```
+
+### FULLNAT 获取客户端真实 IP
+
+配置 `toa = on`，并在 RS 上加载 TOA 内核模块（例如 DPVS 的 `kmod/toa`）。没有加载模块时，RS 会忽略这个 TCP 选项。
+
+### 控制命令
+
+```bash
+scripts/l4lbctl.py stats            # 计数器（-v 显示全部和每个 worker）
+scripts/l4lbctl.py services         # 服务、RS 及状态
+scripts/l4lbctl.py weight 2 0       # RS 2 排空：不接新连接，已有连接保持
+scripts/l4lbctl.py disable 2        # RS 2 下线：已有连接也断开
+scripts/l4lbctl.py add 0 192.168.154.134:80:50
+scripts/l4lbctl.py del 2
+```
+
+## 五、测试
+
+```bash
+ctest --test-dir build                                    # 单元测试
+sudo python3 tests/functional/run_tests.py build/l4lb     # 功能测试（需要 root 和大页）
+tests/perf/run_bench.sh http://<VIP>/ <标签>               # 性能测试（在客户端机器上）
+```
+
+功能测试在 veth 上用 `net_af_packet` 运行 l4lb，覆盖 FULLNAT/DR 转发、畸形包、会话回收、TCP 状态机、LIP、TOA、ICMP 差错、ARP/网关、健康检查、控制命令、多核。
+
+## 六、历史性能数据（重构前，仅供参考）
+
+| 测试场景 | QPS | 平均延迟 |
 | :--- | :---: | :---: |
-| **不经过 L4 均衡器 (直连 RS)** | 131,716 | 12.34 ms |
-| **经过 L4 均衡器 (DR 模式)** | 120,051 | 12.54 ms |
-| **经过 L4 均衡器 (FULLNAT 模式)** | 108,635 | 13.05 ms |
+| 直连 RS | 131,716 | 12.34 ms |
+| DR | 120,051 | 12.54 ms |
+| FULLNAT | 108,635 | 13.05 ms |
 
-*(测试条件参考：`wrk -t4 -c2000 -d30s`，4 线程 2000 连接，压测时长 30 秒)*
+`wrk -t4 -c2000 -d30s`，长连接。这组数据的瓶颈在 RS 和虚拟机，并不反映 LB 本身的能力，测试方法见 `tests/perf/README.md`。

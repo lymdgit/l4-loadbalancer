@@ -39,10 +39,14 @@ class LB:
 
     def __init__(self, binary, mode="nat", ports="80", timeout=300, lcores="11",
                  rs1_mac="02:00:00:00:00:11", rs_count=2, extra_args=(),
-                 qpairs=None):
+                 qpairs=None, conf=None):
         self.binary = binary
-        self.conf = BASE_CONF.format(mode=mode, ports=ports, timeout=timeout,
-                                     rs1_mac=rs1_mac, rs_count=rs_count)
+        self.ctl_path = "/tmp/l4t%d.sock" % os.getpid()
+        self.conf = conf if conf is not None else BASE_CONF.format(
+            mode=mode, ports=ports, timeout=timeout, rs1_mac=rs1_mac,
+            rs_count=rs_count)
+        if "[control]" not in self.conf:
+            self.conf += "\n[control]\nsocket = %s\n" % self.ctl_path
         self.lcores = lcores
         self.extra_args = list(extra_args)
         # 默认每个 lcore 一对队列；af_packet 多队列用 PACKET_FANOUT_HASH 分流
@@ -79,7 +83,7 @@ class LB:
         self.sock.setsockopt(socket.SOL_SOCKET, 32, 16 << 20)  # SO_SNDBUFFORCE
         self.sock.bind((IFACE_PEER, 0))
         self.sock.setblocking(False)
-        self.drain(0.3)
+        self.startup_frames = self.recv(timeout=0.3, idle=0.3)
         return self
 
     def started(self):
@@ -144,6 +148,20 @@ class LB:
         os.unlink(self.conf_path)
         os.unlink(self.log_file.name)
         sh("ip link del %s 2>/dev/null || true" % IFACE_LB)
+
+    def ctl(self, cmd):
+        """Run a control command over the unix socket, return the reply."""
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(self.ctl_path)
+        s.sendall((cmd + "\n").encode())
+        out = b""
+        while True:
+            c = s.recv(65536)
+            if not c:
+                break
+            out += c
+        s.close()
+        return out.decode()
 
     def final_stat(self, name):
         """Parse a counter from the 'Final Statistics' block."""

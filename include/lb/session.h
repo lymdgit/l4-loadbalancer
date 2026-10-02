@@ -1,190 +1,145 @@
 /**
  * @file session.h
- * @brief Session manager - per-lcore 正向表 + 全局 rte_hash 反向表
+ * @brief per-worker 会话表：rte_hash 索引 + 预分配会话数组 + 时间轮
  *
- * 正向表：per-lcore unordered_map，只由所属 lcore 访问，无锁。
+ * 每个 worker 一张表，只由所属 worker 访问，没有锁、没有原子操作、
+ * 热路径上没有 malloc：
+ * - 一个会话在 hash 里有两个 key：客户端方向五元组（Client -> VIP）和
+ *   FULLNAT 回程五元组（RS -> LIP），都指向同一个会话下标
+ * - 会话对象放在启动时一次性分配的数组里，空闲下标用栈管理
+ * - 超时用 1 秒粒度的时间轮：每包只更新 expire_tick（不移动链表），
+ *   时间轮扫到时再判断是否真的过期，未过期的重新挂到新位置；
+ *   每次推进有处理数量上限，不会出现全表扫描造成的停顿
  *
- * 反向表：全局 rte_hash，FULLNAT 回程包可能落在任意 lcore 上，所以需要共享：
- * - RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY_LF：读路径无锁
- * - RTE_HASH_EXTRA_FLAGS_MULTI_WRITER_ADD：多个 lcore 同时增删时由 rte_hash 内部加锁
- * - 内置 RCU QSBR（defer queue 模式）：删除后的 key 槽位和 value 要等所有
- *   worker 都经过一次静默期（rte_rcu_qsbr_quiescent）后才回收，
- *   保证正在读的 lcore 不会读到被复用的槽位
- * - value 是从 mempool 取出的 ReverseEntry 指针：先填好再用 add_key_data 发布，
- *   回收时由 RCU 回调放回 mempool
+ * 回程包能回到创建会话的 worker 由 dataplane/steering.h 保证。
  *
- * 阶段 3 会改为 per-lcore 反向表（回程包导回本核），届时不再需要 RCU。
- *
- * 实现见 src/lb/session.cpp
+ * @author L4 Load Balancer Project
  */
 
 #ifndef L4LB_LB_SESSION_H
 #define L4LB_LB_SESSION_H
 
 #include "common/types.h"
-#include <array>
-#include <atomic>
+#include "lb/tcp_state.h"
 #include <cstddef>
 #include <cstdint>
-#include <unordered_map>
-
-#include <rte_config.h> // RTE_MAX_LCORE
-#include <rte_rcu_qsbr.h>
 
 struct rte_hash;
-struct rte_mempool;
 
 namespace l4lb {
 
-struct SessionDebugStats {
-  uint64_t lookup_hit = 0;
-  uint64_t lookup_miss = 0;
-  uint64_t reverse_hit = 0;
-  uint64_t reverse_miss = 0;
-  uint64_t create = 0;
-  uint64_t create_fail = 0; ///< NAT 端口或反向表分配失败
-  uint64_t replaced = 0;    ///< 同一五元组的旧会话被替换
-  uint64_t update_miss = 0;
-  uint64_t cleanup_removed = 0;
+/// 会话标志
+enum SessionFlag : uint8_t {
+  SF_TOA_PENDING = 0x01, ///< 还需要在客户端方向的包里插入 TOA
+  SF_FULLNAT = 0x02,     ///< 有回程 key（FULLNAT）
 };
 
-class SessionManager {
+struct Session {
+  FiveTuple client; ///< Client -> VIP（入站方向，网络字节序）
+  FiveTuple server; ///< RS -> LIP（FULLNAT 回程方向）；DR 模式全 0
+  uint32_t rs_id;   ///< snapshot 中的 RS id
+  uint16_t svc_idx; ///< snapshot 中的服务下标（只用于统计/展示）
+  TcpState state;
+  uint8_t fin_seen; ///< bit0 客户端发过 FIN，bit1 RS 发过 FIN
+  uint8_t flags;    ///< SessionFlag
+
+  // 下一跳 MAC 缓存：邻居表 generation 变化时重新查询
+  MacAddr rs_mac;
+  MacAddr cli_mac;
+  MacAddr cli_src_mac; ///< 客户端首包的源 MAC（直连且邻居表未解析时兜底）
+  uint32_t rs_mac_gen;
+  uint32_t cli_mac_gen;
+
+  uint64_t created_tick;
+  uint64_t expire_tick; ///< 秒级 tick，>= 这个值即过期（存活时间 >= 超时）
+
+  // 统计
+  uint64_t pkts_in, bytes_in;   ///< Client -> RS
+  uint64_t pkts_out, bytes_out; ///< RS -> Client
+
+  // 时间轮链表（内部使用）
+  uint64_t slot_tick;
+  uint32_t wheel_prev, wheel_next;
+  bool in_pending;
+};
+
+class SessionTable {
 public:
-  static SessionManager &instance() {
-    // static 变量只会被初始化一次；返回引用保证实例一定存在
-    static SessionManager mgr;
-    return mgr;
+  static constexpr uint32_t kNil = UINT32_MAX;
+  static constexpr uint32_t kWheelSlots = 4096; ///< 2 的幂；超时可以超过它
+  static constexpr size_t kExpireBudget = 4096; ///< 每次推进最多处理的会话数
+
+  SessionTable() = default;
+  ~SessionTable();
+  SessionTable(const SessionTable &) = delete;
+  SessionTable &operator=(const SessionTable &) = delete;
+
+  /**
+   * @param name rte_hash 名字（全局唯一）
+   * @param capacity 最大会话数
+   * @param now_tick 当前秒级 tick
+   */
+  bool init(const char *name, uint32_t capacity, int socket_id,
+            uint64_t now_tick);
+  void destroy();
+
+  /// 按任一方向的五元组查找
+  Session *lookup(const FiveTuple &key) const;
+
+  /// key 是否已被占用（SNAT 端口分配用）
+  bool key_in_use(const FiveTuple &key) const { return lookup(key) != nullptr; }
+
+  /**
+   * @brief 创建会话并插入 hash
+   * @param server 非空时（FULLNAT）同时插入回程 key
+   * @return nullptr 表示会话表满或 key 冲突
+   */
+  Session *create(const FiveTuple &client, const FiveTuple *server,
+                  uint64_t now_tick, uint32_t timeout);
+
+  /// 删除会话（两个 key 都删除）
+  void remove(Session *s);
+
+  /// 刷新超时；超时变短时立即移动到对应的时间轮槽位
+  void touch(Session *s, uint64_t now_tick, uint32_t timeout);
+
+  /**
+   * @brief 推进时间轮，删除已过期的会话
+   * @return 本次删除的会话数
+   */
+  size_t expire(uint64_t now_tick);
+
+  uint32_t active() const { return capacity_ - free_top_; }
+  uint32_t capacity() const { return capacity_; }
+  Session *at(uint32_t idx) { return &sessions_[idx]; }
+  uint32_t index_of(const Session *s) const {
+    return static_cast<uint32_t>(s - sessions_);
   }
 
-  /**
-   * @brief 初始化反向哈希表和 RCU（必须在 EAL 初始化之后调用）
-   *
-   * rte_hash / mempool 依赖 DPDK hugepage 内存，因此不能在构造函数中完成，
-   * 必须在 rte_eal_init() 之后显式调用。
-   */
-  bool init();
-
-  /// 释放反向哈希表资源（所有 worker 必须已调用 worker_offline）
-  void cleanup();
-
-  /// 设置会话超时（秒）
-  void set_timeout(uint32_t seconds);
-
-  // ---------------------------------------------------------------------------
-  // RCU：每个 worker lcore 进入循环前 online，每轮循环 quiescent，退出前 offline
-  // ---------------------------------------------------------------------------
-  void worker_online(unsigned lcore_id);
-  void worker_offline(unsigned lcore_id);
-
-  /// 报告静默期：本 lcore 此刻不持有任何反向表 value 指针
-  void quiescent(unsigned lcore_id) {
-    rte_rcu_qsbr_quiescent(qsbr_, lcore_id);
+  /// 遍历所有活跃会话（控制面展示用，只能在所属 worker 上调用）
+  template <typename F> void for_each(F &&fn) {
+    for (uint32_t i = 0; i < capacity_; ++i)
+      if (sessions_[i].wheel_prev != kFree)
+        fn(sessions_[i]);
   }
-
-  // ---------------------------------------------------------------------------
-  // 会话操作（正向表只访问当前 lcore 的那一份）
-  // ---------------------------------------------------------------------------
-
-  /// 在本 lcore 的正向表中查找会话
-  bool lookup(const FiveTuple &tuple, Session &session);
-
-  /**
-   * @brief 反向查找（Lock-Free 读路径）
-   *
-   * 读到的 value 在本 lcore 下一次 quiescent() 之前一直有效。
-   */
-  bool lookup_reverse(const FiveTuple &reverse_tuple, Session &session);
-
-  /**
-   * @brief 创建会话；同一五元组的旧会话（及其反向表条目）会先被删除
-   *
-   * @param rs_ip 非 0 时（NAT 模式）分配 SNAT 源端口并插入反向表
-   * @param nat_src_port [out] 分配的 NAT 源端口（网络字节序），DR 模式为 0
-   * @return false NAT 端口或反向表空间耗尽，会话未创建
-   */
-  bool create(const FiveTuple &client_tuple, uint32_t server_id,
-              IPv4Addr rs_ip, Port rs_port, Port &nat_src_port);
-
-  /// 删除本 lcore 正向表中的会话及其反向表条目
-  bool remove(const FiveTuple &client_tuple);
-
-  /// 更新本 lcore 正向表中会话的活跃时间和计数
-  void update_stats(const FiveTuple &tuple, uint64_t bytes);
-
-  /// 清理本 lcore 的过期会话，返回清理数量
-  size_t cleanup_local(uint64_t now_tsc);
-
-  /// 汇总所有 lcore 的会话数
-  Statistics get_stats() const;
-
-  SessionDebugStats get_debug_stats() const;
 
 private:
-  SessionManager() : timeout_sec_(300), timeout_tsc_(0) {}
+  static constexpr uint32_t kFree = UINT32_MAX - 1; ///< wheel_prev 标记空闲
 
-  /// 反向表 value（从 mempool 分配，RCU 回收）
-  struct ReverseEntry {
-    FiveTuple client_tuple;
-    uint32_t real_server_id;
-  };
+  void wheel_link(uint32_t idx, uint64_t tick);
+  void wheel_unlink(uint32_t idx);
+  void pending_push(uint32_t idx);
+  uint32_t pending_pop();
 
-  struct Table {
-    std::unordered_map<FiveTuple, Session, FiveTupleHash> sessions;
-    uint64_t last_cleanup_tsc = 0;
-  };
+  struct rte_hash *hash_ = nullptr;
+  Session *sessions_ = nullptr;
+  uint32_t *free_stack_ = nullptr;
+  uint32_t free_top_ = 0; ///< 空闲下标数量
+  uint32_t capacity_ = 0;
 
-  /// per-lcore 计数器，只由所属 lcore 写（见 common/stats.h）
-  struct alignas(RTE_CACHE_LINE_SIZE) LcoreCounters {
-    std::atomic<uint64_t> created{0};
-    std::atomic<uint64_t> removed{0};
-    std::atomic<uint64_t> lookup_hit{0};
-    std::atomic<uint64_t> lookup_miss{0};
-    std::atomic<uint64_t> reverse_hit{0};
-    std::atomic<uint64_t> reverse_miss{0};
-    std::atomic<uint64_t> create_fail{0};
-    std::atomic<uint64_t> replaced{0};
-    std::atomic<uint64_t> update_miss{0};
-    std::atomic<uint64_t> cleanup_removed{0};
-  };
-
-  /// 当前 lcore 的正向表
-  Table &local_table();
-  LcoreCounters &local_counters();
-
-  /// 删除一条正向表条目及其反向表条目，返回下一个迭代器
-  using SessionIter =
-      std::unordered_map<FiveTuple, Session, FiveTupleHash>::iterator;
-  SessionIter erase_session(Table &tbl, SessionIter it);
-
-  /**
-   * @brief 分配 NAT 源端口并插入反向表
-   * @return true 成功，nat_port 为网络字节序端口
-   */
-  bool allocate_nat_src_port(IPv4Addr rs_ip, Port rs_port,
-                             const FiveTuple &client_tuple,
-                             uint32_t server_id, Port &nat_port);
-
-  /// RCU 回收回调：把 ReverseEntry 放回 mempool
-  static void free_reverse_entry(void *p, void *key_data);
-
-  uint32_t timeout_sec_;
-  uint64_t timeout_tsc_;
-  uint64_t touch_tsc_{0};
-  uint64_t cleanup_interval_tsc_{0};
-  std::atomic<uint32_t> next_nat_port_{0};
-
-  // 正向表和计数器（per-lcore，无跨核写）
-  std::array<Table, RTE_MAX_LCORE> tables_;
-  std::array<LcoreCounters, RTE_MAX_LCORE> counters_;
-
-  // 反向表
-  static const uint32_t kReverseCapacity = 131072; // 128K 条目
-  struct rte_hash *reverse_hash_ = nullptr;
-  struct rte_mempool *reverse_pool_ = nullptr;
-  struct rte_rcu_qsbr *qsbr_ = nullptr;
-
-  SessionManager(const SessionManager &) = delete;
-  SessionManager &operator=(const SessionManager &) = delete;
+  uint32_t *slots_ = nullptr; ///< 每个槽位的链表头
+  uint32_t pending_ = kNil;   ///< 正在处理的槽位（处理到一半时剩余的部分）
+  uint64_t cur_tick_ = 0;     ///< 下一个要处理的 tick
 };
 
 } // namespace l4lb

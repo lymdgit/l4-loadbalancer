@@ -5,8 +5,8 @@
  * 本文件定义了负载均衡器中使用的所有核心数据结构，包括：
  * - 五元组 (FiveTuple): 用于标识一个网络连接
  * - 数据包元信息 (PacketMeta): 解析后的数据包信息
- * - 后端服务器 (RealServer): 真实服务器信息
- * - 会话信息 (Session): 连接会话状态
+ *
+ * 后端服务器见 ctrl/snapshot.h，会话见 lb/session.h，统计见 common/stats.h
  *
  * @author L4 Load Balancer Project
  * @date 2024
@@ -142,6 +142,14 @@ struct __attribute__((packed)) FiveTuple {
     return memcmp(this, &other, sizeof(FiveTuple)) == 0;
   }
 
+  /// 打包成 3 个 32 位字（用于哈希，避免按 13 字节读取时越界）
+  void words(uint32_t w[3]) const {
+    w[0] = src_ip;
+    w[1] = dst_ip;
+    w[2] = (static_cast<uint32_t>(src_port) << 16) ^ dst_port ^
+           (static_cast<uint32_t>(protocol) << 8);
+  }
+
   /// 生成反向五元组（源和目的交换）
   FiveTuple reverse() const {
     return FiveTuple(dst_ip, src_ip, dst_port, src_port, protocol);
@@ -192,8 +200,9 @@ struct PacketMeta {
   uint8_t ip_ttl;      ///< TTL
 
   // 传输层信息
-  Port src_port; ///< 源端口
-  Port dst_port; ///< 目的端口
+  Port src_port;     ///< 源端口
+  Port dst_port;     ///< 目的端口
+  uint8_t tcp_flags; ///< TCP 标志位（非 TCP 为 0）
 
   // 各层头部偏移量（用于零拷贝修改）
   uint16_t l2_offset;      ///< 以太网头偏移
@@ -212,105 +221,6 @@ struct PacketMeta {
 };
 
 // ============================================================================
-// 后端服务器定义
-// ============================================================================
-
-/**
- * @brief Real Server 结构
- *
- * 表示一个后端真实服务器的信息
- */
-struct RealServer {
-  uint32_t id;         ///< 服务器唯一 ID
-  IPv4Addr ip;         ///< 服务器 IP 地址
-  Port port;           ///< 服务端口
-  MacAddr mac;         ///< MAC 地址（用于 DR 模式）
-  uint32_t weight;     ///< 权重（影响流量分配比例）
-  ServerStatus status; ///< 服务器状态
-
-  // 统计信息
-  uint64_t conn_count; ///< 当前连接数
-  uint64_t total_conn; ///< 总连接数
-  uint64_t bytes_in;   ///< 入站字节数
-  uint64_t bytes_out;  ///< 出站字节数
-
-  RealServer()
-      : id(0), ip(0), port(0), mac{}, weight(100),
-        status(ServerStatus::CHECKING), conn_count(0), total_conn(0),
-        bytes_in(0), bytes_out(0) {}
-
-  /// 检查服务器是否可用
-  bool is_available() const { return status == ServerStatus::UP; }
-};
-
-// ============================================================================
-// 会话信息定义
-// ============================================================================
-
-/**
- * @brief 会话结构
- *
- * 记录一个连接的状态信息，用于：
- * 1. 会话保持：同一连接的所有包发往同一后端
- * 2. NAT 连接跟踪：记录地址转换信息
- */
-struct Session {
-  FiveTuple client_tuple;  ///< 客户端五元组（原始）
-  FiveTuple server_tuple;  ///< 后端五元组（转换后）
-  uint32_t real_server_id; ///< 分配的后端服务器 ID
-  Port nat_src_port;       ///< SNAT 源端口(网络字节序, 0 表示未做端口转换)
-  uint64_t create_time;    ///< 创建时间（TSC）
-  uint64_t last_active;    ///< 最后活跃时间（TSC）
-  uint64_t packets;        ///< 数据包计数
-  uint64_t bytes;          ///< 字节计数
-
-  /// 更新活跃时间（使用 TSC，避免 chrono 系统调用）
-  void touch(uint64_t tsc) { last_active = tsc; }
-
-  /**
-   * @brief 检查会话是否过期
-   * @param now_tsc 当前 TSC
-   * @param timeout_tsc 超时 TSC 间隔 (rte_get_tsc_hz() * timeout_sec)
-   */
-  bool is_expired(uint64_t now_tsc, uint64_t timeout_tsc) const {
-    return (now_tsc - last_active) > timeout_tsc;
-  }
-};
-
-// ============================================================================
-// 统计信息
-// ============================================================================
-
-/**
- * @brief 全局统计信息
- *
- * 用于监控和调优
- */
-struct Statistics {
-  // 数据包计数
-  uint64_t rx_packets;      ///< 接收数据包数
-  uint64_t tx_packets;      ///< 发送数据包数
-  uint64_t dropped_packets; ///< 丢弃数据包数
-
-  // 协议分类计数
-  uint64_t arp_packets;  ///< ARP 数据包数
-  uint64_t icmp_packets; ///< ICMP 数据包数
-  uint64_t tcp_packets;  ///< TCP 数据包数
-  uint64_t udp_packets;  ///< UDP 数据包数
-
-  // 转发统计
-  uint64_t forwarded_packets; ///< 成功转发数
-  uint64_t nat_translations;  ///< NAT 转换次数
-
-  // 会话统计
-  uint64_t active_sessions; ///< 当前活跃会话
-  uint64_t total_sessions;  ///< 总会话数
-
-  /// 重置所有计数器
-  void reset() { std::memset(this, 0, sizeof(Statistics)); }
-};
-
-// ============================================================================
 // 工具函数（实现见 src/common/types.cpp）
 // ============================================================================
 
@@ -324,6 +234,9 @@ struct Statistics {
  */
 IPv4Addr ip_from_string(const std::string &ip_str);
 
+/// 严格解析 IPv4 地址，失败返回 false
+bool parse_ipv4(const std::string &ip_str, IPv4Addr &out);
+
 /**
  * @brief 网络字节序 IP 转字符串
  */
@@ -336,6 +249,17 @@ std::string ip_to_string(IPv4Addr ip);
  * @return MAC 地址数组，解析失败返回全 0
  */
 MacAddr mac_from_string(const std::string &mac_str);
+
+/// 严格解析 MAC 地址，失败返回 false
+bool parse_mac(const std::string &mac_str, MacAddr &out);
+
+/// MAC 是否全 0
+inline bool mac_is_zero(const MacAddr &mac) {
+  for (auto b : mac)
+    if (b)
+      return false;
+  return true;
+}
 
 /**
  * @brief MAC 地址转字符串

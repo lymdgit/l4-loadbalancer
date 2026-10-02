@@ -19,7 +19,15 @@ enum class IcmpType : uint8_t {
     DEST_UNREACH = 3,
     ECHO_REQUEST = 8,
     TIME_EXCEEDED = 11,
+    PARAM_PROBLEM = 12,
 };
+
+/// 携带原始报文头的 ICMP 差错类型（需要随会话做 NAT）
+inline bool icmp_is_error(uint8_t type) {
+    return type == static_cast<uint8_t>(IcmpType::DEST_UNREACH) ||
+           type == static_cast<uint8_t>(IcmpType::TIME_EXCEEDED) ||
+           type == static_cast<uint8_t>(IcmpType::PARAM_PROBLEM);
+}
 
 /// ICMP 头结构
 struct __attribute__((packed)) IcmpHeader {
