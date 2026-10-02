@@ -1,0 +1,16 @@
+# 构建产物
+build/
+build-*/
+cmake-build-*/
+compile_commands.json
+
+# 测试与性能分析产物
+__pycache__/
+*.pyc
+perf.data*
+*.svg
+tests/perf/results/
+
+# 后端测试服务器的二进制
+RS_Src/epoll_server/simple_server_mt
+RS_Src/iouring_server/server_mt
