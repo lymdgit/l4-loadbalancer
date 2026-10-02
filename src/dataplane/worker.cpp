@@ -216,6 +216,7 @@ std::string format_stats(bool verbose) {
      << t[ST_SESS_CLOSED] << "\n";
   os << "Redirect: out " << t[ST_REDIRECT_OUT] << ", in "
      << t[ST_REDIRECT_IN] << ", rss mismatch " << t[ST_RSS_MISMATCH]
+     << ", rss no hash " << t[ST_RSS_NO_HASH]
      << " | neighbors " << g_dp.neigh.count() << "\n";
   os << "Drops:";
   bool any = false;

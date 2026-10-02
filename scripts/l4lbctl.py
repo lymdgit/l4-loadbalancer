@@ -17,8 +17,11 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-s", "--socket", default="/run/l4lb.sock")
-    ap.add_argument("command", nargs="*", default=["help"])
+    ap.add_argument("command", nargs=argparse.REMAINDER,
+                    help="command and its arguments (e.g. stats -v)")
     args = ap.parse_args()
+    if not args.command:
+        args.command = ["help"]
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         s.connect(args.socket)

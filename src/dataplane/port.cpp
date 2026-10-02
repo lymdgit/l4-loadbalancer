@@ -97,9 +97,8 @@ int port_init(uint16_t port, struct rte_mempool *pool, uint16_t want_queues,
   conf.txmode.mq_mode = RTE_ETH_MQ_TX_NONE;
   conf.txmode.offloads = want_tx & info.tx_offload_capa;
   out.tx_offloads = conf.txmode.offloads;
-  // RX：校验和检查（坏包在 processor 中丢弃）+ RSS hash 写入 mbuf
-  conf.rxmode.offloads = info.rx_offload_capa & (RTE_ETH_RX_OFFLOAD_CHECKSUM |
-                                                 RTE_ETH_RX_OFFLOAD_RSS_HASH);
+  // RX：校验和检查（坏包在 processor 中丢弃）；RSS hash 写入 mbuf 只在启用 RSS 时
+  conf.rxmode.offloads = info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_CHECKSUM;
 
   // RSS：显式设置 key，便于软件复现网卡的 hash
   static uint8_t rss_key[Steering::kRssKeyLen];
@@ -107,14 +106,22 @@ int port_init(uint16_t port, struct rte_mempool *pool, uint16_t want_queues,
   uint64_t rss_hf = (RTE_ETH_RSS_IPV4 | RTE_ETH_RSS_NONFRAG_IPV4_TCP |
                      RTE_ETH_RSS_NONFRAG_IPV4_UDP) &
                     info.flow_type_rss_offloads;
-  bool key_ok = info.hash_key_size == 0 ||
-                info.hash_key_size == Steering::kRssKeyLen;
+  // hash_key_size == 0：驱动不接受自定义 key（如 vmxnet3），只能传 NULL，
+  // 驱动使用内置默认 key。vmxnet3 的默认 key 就是 kDefaultRssKey，软件
+  // Toeplitz 与网卡一致；万一不一致，ST_RSS_MISMATCH 计数会暴露出来
+  bool custom_key = info.hash_key_size == Steering::kRssKeyLen;
+  bool key_ok = custom_key || info.hash_key_size == 0;
   bool use_rss = nq > 1 && !force_sw && (rss_hf & RTE_ETH_RSS_IPV4) && key_ok;
   if (use_rss) {
     conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
-    conf.rx_adv_conf.rss_conf.rss_key = rss_key;
-    conf.rx_adv_conf.rss_conf.rss_key_len = Steering::kRssKeyLen;
+    conf.rx_adv_conf.rss_conf.rss_key = custom_key ? rss_key : nullptr;
+    conf.rx_adv_conf.rss_conf.rss_key_len = custom_key ? Steering::kRssKeyLen : 0;
     conf.rx_adv_conf.rss_conf.rss_hf = rss_hf;
+    // ethdev 要求：请求 RSS_HASH offload 时 mq_mode 必须是 RSS
+    conf.rxmode.offloads |= info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_RSS_HASH;
+    if (!custom_key)
+      LOG_INFO("NIC does not accept a custom RSS key, using the driver "
+               "default (assumed to be the standard Toeplitz key)");
   } else {
     conf.rxmode.mq_mode = RTE_ETH_MQ_RX_NONE;
   }

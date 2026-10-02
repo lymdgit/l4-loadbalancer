@@ -69,6 +69,7 @@ enum Stat : uint32_t {
   ST_REDIRECT_OUT,    ///< 本核收到、转交给 owner
   ST_REDIRECT_IN,     ///< 从其他核转交来
   ST_RSS_MISMATCH,    ///< 网卡 RSS hash 与软件计算不一致（自检）
+  ST_RSS_NO_HASH,     ///< HW 模式下网卡没有给出 RSS hash（RSS 实际未生效）
   // FULLNAT 选项处理
   ST_TOA_ADDED,
   ST_TOA_NO_ROOM,

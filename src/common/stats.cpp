@@ -39,6 +39,7 @@ const char *stat_name(Stat id) {
       "redirect_out",
       "redirect_in",
       "rss_mismatch",
+      "rss_no_hash",
       "toa_added",
       "toa_no_room",
       "ts_stripped",

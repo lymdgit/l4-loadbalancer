@@ -227,10 +227,14 @@ Result handle_inbound(WorkerCtx &w, const Snapshot &snap, const Service &svc,
   const bool syn = tcp && (meta.tcp_flags & (TCP_SYN | TCP_ACK | TCP_RST)) ==
                               TCP_SYN;
 
-  // 自检：网卡给出的 RSS hash 应与软件计算一致（只抽查 SYN）
-  if (syn && st.hw() && (m->ol_flags & RTE_MBUF_F_RX_RSS_HASH) &&
-      m->hash.rss != st.rss_hash(tuple, st.l4_hashed(6)))
-    w.stats.add(ST_RSS_MISMATCH);
+  // 自检（只抽查 SYN）：网卡给出的 RSS hash 应与软件计算一致；
+  // 没有 hash 说明网卡/虚拟化层没有真正做 RSS 分发（如 vmxnet3 未开启 RSS）
+  if (syn && st.hw() && !redirected) {
+    if (!(m->ol_flags & RTE_MBUF_F_RX_RSS_HASH))
+      w.stats.add(ST_RSS_NO_HASH);
+    else if (m->hash.rss != st.rss_hash(tuple, st.l4_hashed(6)))
+      w.stats.add(ST_RSS_MISMATCH);
+  }
 
   auto *eth = rte_pktmbuf_mtod(m, EthernetHeader *);
   Session *s = w.sessions.lookup(tuple);

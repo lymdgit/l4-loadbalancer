@@ -273,8 +273,8 @@ int main(int argc, char *argv[]) {
   LOG_INFO("  Session create fail: %lu, replaced: 0, cleaned: %lu",
            t[ST_DROP_TABLE_FULL] + t[ST_DROP_NO_PORT],
            t[ST_SESS_EXPIRED] + t[ST_SESS_CLOSED]);
-  LOG_INFO("  Redirect out: %lu, RSS mismatch: %lu", t[ST_REDIRECT_OUT],
-           t[ST_RSS_MISMATCH]);
+  LOG_INFO("  Redirect out: %lu, RSS mismatch: %lu, RSS no hash: %lu",
+           t[ST_REDIRECT_OUT], t[ST_RSS_MISMATCH], t[ST_RSS_NO_HASH]);
   for (unsigned i = ST_DROP_MALFORMED; i <= ST_DROP_OTHER; ++i)
     if (t.c[i])
       LOG_INFO("  %s: %lu", stat_name(static_cast<Stat>(i)), t.c[i]);
