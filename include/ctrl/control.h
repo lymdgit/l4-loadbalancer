@@ -24,8 +24,10 @@
 #define L4LB_CTRL_CONTROL_H
 
 #include <atomic>
+#include <cstdint>
 #include <string>
-#include <thread>
+
+#include <rte_thread.h>
 
 namespace l4lb {
 
@@ -40,10 +42,12 @@ public:
 private:
   void run();
   void drain_health();
+  static uint32_t thread_main(void *self);
 
   std::string path_;
   int listen_fd_ = -1;
-  std::thread thread_;
+  rte_thread_t thread_{};
+  bool started_ = false;
   std::atomic<bool> stop_{false};
 };
 

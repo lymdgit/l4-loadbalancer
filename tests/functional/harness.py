@@ -39,20 +39,32 @@ class LB:
 
     def __init__(self, binary, mode="nat", ports="80", timeout=300, lcores="11",
                  rs1_mac="02:00:00:00:00:11", rs_count=2, extra_args=(),
-                 qpairs=None, conf=None):
+                 qpairs=None, conf=None, ready_file=None, dataplane=None):
         self.binary = binary
         self.ctl_path = "/tmp/l4t%d.sock" % os.getpid()
         self.conf = conf if conf is not None else BASE_CONF.format(
             mode=mode, ports=ports, timeout=timeout, rs1_mac=rs1_mac,
             rs_count=rs_count)
+        # L4T_DATAPLANE=pipeline：用 pipeline 模式跑全部用例（lcore 数 +1 给 receiver）
+        if not dataplane and os.environ.get("L4T_DATAPLANE") == "pipeline":
+            dataplane = "pipeline"
+            if len(expand_lcores(lcores)) == 1:
+                lcores = "%d-%d" % (expand_lcores(lcores)[0] - 1, expand_lcores(lcores)[0])
+        if dataplane and "dataplane =" not in self.conf:
+            self.conf = self.conf.replace("[global]", "[global]\ndataplane = %s" % dataplane, 1)
         if "[control]" not in self.conf:
             self.conf += "\n[control]\nsocket = %s\n" % self.ctl_path
         self.lcores = lcores
         self.extra_args = list(extra_args)
-        # 默认每个 lcore 一对队列；af_packet 多队列用 PACKET_FANOUT_HASH 分流
-        self.qpairs = qpairs or len(expand_lcores(lcores))
+        # 队列数 = worker 数 + 1（master 线程的 TX 队列）；pipeline 的 receiver 不占队列。
+        # af_packet 用 PACKET_FANOUT_HASH 往每个 qpair 分包，qpair 数必须等于 l4lb
+        # 配置的 RX 队列数，否则多出来的 socket 收到的包没人读
+        workers = len(expand_lcores(lcores)) - (1 if dataplane == "pipeline" else 0)
+        self.qpairs = qpairs or workers + 1
         self.proc = None
         self.log = ""
+        # 日志写文件且不输出 stderr 时，从这个文件判断启动完成
+        self.ready_file = ready_file
 
     def __enter__(self):
         sh("ip link del %s 2>/dev/null || true" % IFACE_LB)
@@ -72,7 +84,7 @@ class LB:
                                      stderr=subprocess.STDOUT)
         deadline = time.time() + 15
         while time.time() < deadline:
-            if "L4 Load Balancer is running" in self.read_log():
+            if self.started():
                 break
             if self.proc.poll() is not None:
                 break
@@ -87,7 +99,14 @@ class LB:
         return self
 
     def started(self):
-        return "L4 Load Balancer is running" in self.read_log()
+        marker = "L4 Load Balancer is running"
+        if marker in self.read_log():
+            return True
+        try:
+            with open(self.ready_file, errors="replace") as f:
+                return marker in f.read()
+        except (TypeError, OSError):
+            return False
 
     def read_log(self):
         with open(self.log_file.name, errors="replace") as f:

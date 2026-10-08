@@ -38,6 +38,8 @@ const char *stat_name(Stat id) {
       "sess_closed",
       "redirect_out",
       "redirect_in",
+      "ring_in",
+      "drop_rx_ring",
       "rss_mismatch",
       "rss_no_hash",
       "toa_added",
@@ -49,7 +51,7 @@ const char *stat_name(Stat id) {
 }
 
 uint64_t StatsTotal::drops() const {
-  uint64_t n = c[ST_TX_FULL];
+  uint64_t n = c[ST_TX_FULL] + c[ST_DROP_RX_RING];
   for (unsigned i = ST_DROP_MALFORMED; i <= ST_DROP_OTHER; ++i)
     n += c[i];
   return n;

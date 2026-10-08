@@ -1,6 +1,6 @@
 /**
  * @file healthcheck.h
- * @brief RS 健康检查（数据面内的 TCP 探测，运行在 master lcore 上）
+ * @brief RS 健康检查（数据面内的 TCP 探测，运行在 master 线程上）
  *
  * LB 的网卡被 DPDK 接管，内核协议栈无法直接连 RS，所以探测包由 master 自己
  * 构造：从 hc_src 的专用端口段（kHcPortMin~kHcPortMax）向 RS:port 发 SYN，

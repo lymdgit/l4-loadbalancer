@@ -57,6 +57,7 @@ bool parse_rs_spec(const std::string &spec, RsConf &rs) {
 const char *kHelp =
     "commands:\n"
     "  stats [-v]                     counters\n"
+    "  rate                           last periodic rates and busy %\n"
     "  services                       services and real servers\n"
     "  weight <rs_id> <weight>        0 = drain (no new connections)\n"
     "  enable <rs_id> | disable <rs_id>\n"
@@ -82,6 +83,8 @@ std::string ControlServer::execute(const std::string &line) {
 
   if (cmd == "stats")
     return format_stats(a.size() > 1 && a[1] == "-v");
+  if (cmd == "rate")
+    return perf_report_last();
   if (cmd == "services")
     return mgr.describe();
   if (cmd == "weight" && a.size() == 3 && parse_u32(a[1], id) &&
@@ -142,15 +145,28 @@ bool ControlServer::start(const std::string &path) {
     listen_fd_ = -1;
     return false;
   }
-  thread_ = std::thread(&ControlServer::run, this);
+  // 控制线程：DPDK 把它绑到 -l 之外的 CPU，不与 receiver / worker 抢核
+  if (rte_thread_create_control(&thread_, "l4lb-ctl", thread_main, this) != 0) {
+    LOG_ERROR("control socket: failed to create thread");
+    close(listen_fd_);
+    listen_fd_ = -1;
+    return false;
+  }
+  started_ = true;
   LOG_INFO("Control socket: %s", path.c_str());
   return true;
 }
 
+uint32_t ControlServer::thread_main(void *self) {
+  static_cast<ControlServer *>(self)->run();
+  return 0;
+}
+
 void ControlServer::stop() {
   stop_.store(true);
-  if (thread_.joinable())
-    thread_.join();
+  if (started_)
+    rte_thread_join(thread_, nullptr);
+  started_ = false;
   if (listen_fd_ >= 0) {
     close(listen_fd_);
     unlink(path_.c_str());

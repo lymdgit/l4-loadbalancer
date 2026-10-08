@@ -9,7 +9,7 @@
 #   sudo tests/perf/lab.sh status       # RS 进程、LB 统计
 #   sudo tests/perf/lab.sh rs-stop      # 停止 RS、撤销防火墙端口
 #
-# 可调参数：LB_CORES=1-4  RS_CORES=5-7  CLIENT_CORES=8-11  DURATION=10
+# 可调参数：LB_CORES=1-3（pipeline：1 receiver + 2 worker）  RS_CORES=5-7  CLIENT_CORES=8-11  DURATION=10
 # =============================================================================
 set -euo pipefail
 
@@ -20,7 +20,7 @@ CONF=$ROOT/tests/perf/lab.conf
 VIP=192.168.154.130
 RS_PORTS=(8081 8082)
 RS_NAMES=(a b)
-LB_CORES=${LB_CORES:-1-4}
+LB_CORES=${LB_CORES:-1-3}
 RS_CORES=${RS_CORES:-5-7}
 CLIENT_CORES=${CLIENT_CORES:-8-11}
 DURATION=${DURATION:-10}

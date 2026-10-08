@@ -4,7 +4,7 @@
  *
  * INI 格式：
  *
- *   [global]       mode / log_level / max_sessions / 各状态超时 / toa ...
+ *   [global]       mode / dataplane / log_level / log_dir / max_sessions / 各状态超时 / toa ...
  *   [network]      vip_mac / netmask / gateway / local_ips / hc_src
  *   [healthcheck]  enabled / interval / timeout / failure_threshold / ...
  *   [control]      socket
@@ -42,6 +42,12 @@ constexpr size_t kMaxLocalIps = 64;
 
 /// 调度算法
 enum class SchedulerType { WRR, MAGLEV };
+
+/// 数据面模式（docs/pipeline改造.md）
+enum class DataplaneMode {
+  RTC,      ///< 每个 lcore 收包 + 处理（网卡有 RSS 时用）
+  PIPELINE, ///< main lcore 收包分发，其余 lcore 处理（网卡没有 RSS 时用）
+};
 
 /// Real Server 配置
 struct RsConf {
@@ -83,11 +89,17 @@ struct HealthConf {
 struct LbConfig {
   ForwardMode mode = ForwardMode::NAT;
   std::string log_level = "info";
+  std::string log_dir;             ///< 日志目录，空表示只写 stderr
+  uint32_t log_max_size_mb = 100;  ///< 单个日志文件上限，超过后轮转
+  uint32_t log_max_files = 5;      ///< 保留的旧日志文件个数
+  bool log_stderr = true;          ///< 写文件的同时输出到 stderr
+  uint32_t stats_interval = 10;    ///< 周期统计（含速率、忙碌率）的日志间隔（秒）
   uint32_t max_sessions = 1 << 20; ///< 所有 worker 合计
   TimeoutConf timeouts;
   bool toa = false;                ///< FULLNAT 下插入 TOA 选项透传客户端地址
   bool strip_tcp_timestamp = true; ///< FULLNAT 下去掉 SYN 中的 TCP timestamp
   bool force_sw_steering = false;  ///< steering = sw：不用网卡 RSS（调试用）
+  DataplaneMode dataplane = DataplaneMode::RTC;
 
   MacAddr vip_mac{};               ///< 全 0 表示使用网卡 MAC
   IPv4Addr netmask = 0;            ///< 0 表示所有地址都按直连处理

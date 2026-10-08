@@ -177,6 +177,7 @@ bool Config::build() {
     return false;
   }
   c.log_level = to_lower(get("global", "log_level", c.log_level));
+  c.log_dir = get("global", "log_dir", c.log_dir);
   std::string steering = to_lower(get("global", "steering", "auto"));
   if (steering != "auto" && steering != "sw") {
     LOG_ERROR("config [global] steering = '%s': expected auto or sw",
@@ -184,11 +185,25 @@ bool Config::build() {
     return false;
   }
   c.force_sw_steering = steering == "sw";
+  std::string dp = to_lower(get("global", "dataplane", "rtc"));
+  if (dp == "rtc") {
+    c.dataplane = DataplaneMode::RTC;
+  } else if (dp == "pipeline") {
+    c.dataplane = DataplaneMode::PIPELINE;
+  } else {
+    LOG_ERROR("config [global] dataplane = '%s': expected rtc or pipeline",
+              dp.c_str());
+    return false;
+  }
 
   auto &t = c.timeouts;
   bool ok = get_u32("global", "max_sessions", c.max_sessions, 1024, 1u << 26) &&
             get_bool("global", "toa", c.toa) &&
-            get_bool("global", "strip_tcp_timestamp", c.strip_tcp_timestamp);
+            get_bool("global", "strip_tcp_timestamp", c.strip_tcp_timestamp) &&
+            get_u32("global", "log_max_size_mb", c.log_max_size_mb, 1, 10240) &&
+            get_u32("global", "log_max_files", c.log_max_files, 1, 100) &&
+            get_bool("global", "log_stderr", c.log_stderr) &&
+            get_u32("global", "stats_interval", c.stats_interval, 1, 3600);
   // session_timeout：旧配置项，作为 ESTABLISHED 和 UDP 的超时
   uint32_t legacy_timeout = 0;
   ok = ok && get_u32("global", "session_timeout", legacy_timeout, 1, 86400);
@@ -490,7 +505,16 @@ bool Config::validate() {
 void Config::dump() const {
   const auto &c = lb_;
   LOG_INFO("========== Configuration ==========");
-  LOG_INFO("Forward Mode: %s", c.mode == ForwardMode::NAT ? "FULLNAT" : "DR");
+  LOG_INFO("Forward Mode: %s, dataplane: %s",
+           c.mode == ForwardMode::NAT ? "FULLNAT" : "DR",
+           c.dataplane == DataplaneMode::PIPELINE ? "pipeline" : "rtc");
+  if (c.log_dir.empty())
+    LOG_INFO("Log: level=%s, stderr only", c.log_level.c_str());
+  else
+    LOG_INFO("Log: level=%s dir=%s max_size=%uMB max_files=%u stderr=%s",
+             c.log_level.c_str(), c.log_dir.c_str(), c.log_max_size_mb,
+             c.log_max_files, c.log_stderr ? "on" : "off");
+  LOG_INFO("Stats interval: %us", c.stats_interval);
   LOG_INFO("Max sessions: %u, TOA: %s, strip TCP timestamp: %s",
            c.max_sessions, c.toa ? "on" : "off",
            c.strip_tcp_timestamp ? "on" : "off");

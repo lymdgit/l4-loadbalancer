@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Functional tests for l4lb. Usage: run_tests.py <l4lb binary> [-k substring]"""
+import re
 import sys
 import time
 import traceback
@@ -264,12 +265,63 @@ def multicore_concurrent_sessions():
 @test
 def too_many_lcores_rejected():
     """1.4: more lcores than NIC queues -> refuse to start instead of sharing queues"""
-    # 4 个 lcore，但网卡只给 2 个队列
+    # 4 个 lcore 需要 5 个 TX 队列（含 master 线程），网卡只给 2 个
     with LB(BIN, lcores="8-11", qpairs=2) as lb:
         expect(lb.proc.wait(10) != 0, "should exit with error")
         expect(not lb.started(), "should refuse to start")
-        expect("NIC supports only 2 queues" in lb.read_log(),
+        expect("NIC supports only 2 TX queues" in lb.read_log(),
                "missing error message:\n" + lb.log[-1500:])
+
+
+# ---------------------------------------------------------------------------
+# pipeline 模式（docs/pipeline改造.md）：1 个 receiver + 2 个 worker
+# ---------------------------------------------------------------------------
+def worker_stats(lb):
+    """stats -v 中每个 worker 的 ring_in / redirect_out"""
+    out = {}
+    for m in re.finditer(r"worker (\d+) lcore \d+ rx \d+ ring_in (\d+) tx \d+ "
+                         r"redirect_out (\d+)", lb.ctl("stats -v")):
+        out[int(m.group(1))] = (int(m.group(2)), int(m.group(3)))
+    return out
+
+
+@test
+def pipeline_dispatch():
+    """pipeline: receiver spreads sessions over both workers, replies hit the owner"""
+    with LB(BIN, lcores="8-10", timeout=1, dataplane="pipeline") as lb:
+        expect(lb.started(), "pipeline start failed:\n" + lb.log[-2000:])
+        expect("Receiver started on lcore 8" in lb.log, lb.log[-1500:])
+        expect("Worker 0 started on lcore 9" in lb.log and
+               "Worker 1 started on lcore 10" in lb.log, lb.log[-1500:])
+        expect("Master thread started" in lb.log, lb.log[-1500:])
+        frames = [eth(tcp("10.2.0.1", VIP, 2000 + i, 80, SYN)) for i in range(2000)] + \
+                 [eth(udp("10.2.0.2", VIP, 3000 + i, 80, b"u")) for i in range(200)]
+        lb.send(frames)
+        got = to_rs(lb.recv(timeout=8, idle=0.5))
+        expect(len(got) >= 2100, "%d/2200 forwarded" % len(got))
+        back = to_client(lb.xchg([reply_from(f) for f in got[:600]], timeout=3))
+        expect(len(back) == 600, "%d/600 replies" % len(back))
+        # ARP / ICMP 在任意 worker 上都能处理
+        r = lb.xchg([arp_request(CLIENT, VIP), eth(icmp_echo(CLIENT, VIP))])
+        expect(any(f.etype == 0x0806 for f in r) and any(f.proto == ICMP for f in r),
+               "ARP/ICMP not answered: %r" % r)
+        ws = worker_stats(lb)
+        expect(len(ws) == 2, "stats -v: %r" % ws)
+        # 两个 worker 负载相当；receiver 分发正确时不需要转交
+        expect(min(ws[0][0], ws[1][0]) > 0.35 * (ws[0][0] + ws[1][0]),
+               "unbalanced workers: %r" % ws)
+        expect(ws[0][1] + ws[1][1] == 0, "receiver mis-dispatched: %r" % ws)
+        rc = lb.stop()
+        expect(rc == 0, "rc=%s:\n%s" % (rc, lb.log[-1500:]))
+        expect(lb.final_stat("Redirect out") == 0, lb.log[-1500:])
+
+
+@test
+def pipeline_needs_two_lcores():
+    """pipeline: a single lcore is rejected"""
+    with LB(BIN, lcores="11", dataplane="pipeline", qpairs=2) as lb:
+        expect(lb.proc.wait(10) != 0, "should exit with error")
+        expect("needs at least 2 lcores" in lb.read_log(), lb.log[-1500:])
 
 
 @test

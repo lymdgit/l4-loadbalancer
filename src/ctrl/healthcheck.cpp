@@ -8,6 +8,7 @@
 #include "common/logger.h"
 #include "ctrl/snapshot.h"
 #include "dataplane/context.h"
+#include "dataplane/master.h"
 #include "dataplane/worker.h"
 #include "protocol/checksum.h"
 #include "protocol/ethernet.h"

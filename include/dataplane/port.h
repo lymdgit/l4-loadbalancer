@@ -19,21 +19,39 @@ namespace l4lb {
 
 class Steering;
 
+/**
+ * @brief 队列规划
+ *
+ * TX：每个 worker 一个，master 线程独占最后一个（= num_workers）。
+ * RX：TX 队列数向上取 2 的幂（vmxnet3 要求），不超过网卡上限。af_packet 等
+ *     按 fanout 往每个队列送包的设备，所有 RX 队列都必须有人轮询。
+ */
+struct PortPlan {
+  uint16_t num_workers = 0;
+  uint16_t rx_queues = 0;
+  uint16_t tx_queues = 0;
+};
+
 struct PortSetup {
-  uint16_t num_queues = 0;  ///< 实际 RX/TX 队列数
   uint64_t tx_offloads = 0; ///< 启用的 TX offload
   MacAddr mac{};            ///< 网卡 MAC
   uint16_t mtu = 1500;
 };
 
 /**
+ * @brief 按 worker 数规划队列
+ * @return false 网卡 TX 队列不够（已打印原因）
+ */
+bool port_plan(uint16_t port, uint16_t num_workers, PortPlan &plan);
+
+/**
  * @brief 配置并启动端口，并根据网卡 RSS 能力初始化 steering
  *
- * @param want_queues 期望的队列数（= lcore 数）
- * @param force_sw    强制使用软件分发（调试用）
+ * RSS 只把流量分到 worker 的队列（RETA 第 i 项 -> 队列 i % num_workers）。
+ * @param force_sw 不用 RSS，软件分发（pipeline 模式 / 调试）
  * @return 0 成功，负值为 DPDK 错误码
  */
-int port_init(uint16_t port, struct rte_mempool *pool, uint16_t want_queues,
+int port_init(uint16_t port, struct rte_mempool *pool, const PortPlan &plan,
               bool force_sw, Steering &steering, PortSetup &out);
 
 } // namespace l4lb

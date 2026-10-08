@@ -68,6 +68,8 @@ enum Stat : uint32_t {
   // 多核分发
   ST_REDIRECT_OUT,    ///< 本核收到、转交给 owner
   ST_REDIRECT_IN,     ///< 从其他核转交来
+  ST_RING_IN,         ///< pipeline：从 receiver 的 ring 取到
+  ST_DROP_RX_RING,    ///< pipeline：worker 的 rx_ring 满，receiver 丢弃
   ST_RSS_MISMATCH,    ///< 网卡 RSS hash 与软件计算不一致（自检）
   ST_RSS_NO_HASH,     ///< HW 模式下网卡没有给出 RSS hash（RSS 实际未生效）
   // FULLNAT 选项处理
@@ -83,9 +85,14 @@ const char *stat_name(Stat id);
 /// 一个 worker 的全部计数器
 struct alignas(RTE_CACHE_LINE_SIZE) WorkerStats {
   std::array<std::atomic<uint64_t>, ST_COUNT> c{};
+  /// 忙碌时间：有包处理的那些轮次花掉的 TSC 周期（忙轮询下 CPU 永远 100%，
+  /// 用它除以经过的 TSC 得到真实负载）
+  std::atomic<uint64_t> busy_tsc{0};
 
   void add(Stat id, uint64_t n = 1) { stat_add(c[id], n); }
   uint64_t get(Stat id) const { return stat_get(c[id]); }
+  void add_busy(uint64_t cycles) { stat_add(busy_tsc, cycles); }
+  uint64_t busy() const { return stat_get(busy_tsc); }
 };
 
 /// 汇总后的快照

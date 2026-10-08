@@ -21,6 +21,11 @@ StatsTotal stats_total() {
     for (unsigned s = 0; s < ST_COUNT; ++s)
       t.c[s] += w->stats.get(static_cast<Stat>(s));
   }
+  for (const WorkerStats *a :
+       {g_dp.receiver_stats, g_dp.master ? &g_dp.master->stats : nullptr})
+    if (a)
+      for (unsigned s = 0; s < ST_COUNT; ++s)
+        t.c[s] += a->get(static_cast<Stat>(s));
   return t;
 }
 

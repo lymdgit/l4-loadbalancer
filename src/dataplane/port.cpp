@@ -9,9 +9,11 @@
 #include "dataplane/context.h"
 #include "dataplane/steering.h"
 
+#include <algorithm>
 #include <cstring>
 #include <vector>
 
+#include <rte_common.h>
 #include <rte_cycles.h>
 #include <rte_errno.h>
 #include <rte_ethdev.h>
@@ -71,7 +73,28 @@ void wait_link(uint16_t port) {
 
 } // namespace
 
-int port_init(uint16_t port, struct rte_mempool *pool, uint16_t want_queues,
+bool port_plan(uint16_t port, uint16_t num_workers, PortPlan &plan) {
+  struct rte_eth_dev_info info;
+  int ret = rte_eth_dev_info_get(port, &info);
+  if (ret != 0) {
+    LOG_ERROR("Error getting device info for port %u: %s", port,
+              rte_strerror(-ret));
+    return false;
+  }
+  plan.num_workers = num_workers;
+  plan.tx_queues = num_workers + 1;
+  if (plan.tx_queues > info.max_tx_queues) {
+    LOG_FATAL("NIC supports only %u TX queues but %u are needed (%u workers + "
+              "master thread); use fewer lcores (EAL -l option)",
+              info.max_tx_queues, plan.tx_queues, num_workers);
+    return false;
+  }
+  plan.rx_queues = static_cast<uint16_t>(
+      std::min<uint32_t>(rte_align32pow2(plan.tx_queues), info.max_rx_queues));
+  return true;
+}
+
+int port_init(uint16_t port, struct rte_mempool *pool, const PortPlan &plan,
               bool force_sw, Steering &steering, PortSetup &out) {
   struct rte_eth_dev_info info;
   int ret = rte_eth_dev_info_get(port, &info);
@@ -80,13 +103,7 @@ int port_init(uint16_t port, struct rte_mempool *pool, uint16_t want_queues,
               rte_strerror(-ret));
     return ret;
   }
-
-  uint16_t nq = want_queues;
-  if (nq > info.max_rx_queues)
-    nq = info.max_rx_queues;
-  if (nq > info.max_tx_queues)
-    nq = info.max_tx_queues;
-  out.num_queues = nq;
+  const uint16_t nw = plan.num_workers;
 
   struct rte_eth_conf conf;
   memset(&conf, 0, sizeof(conf));
@@ -111,7 +128,7 @@ int port_init(uint16_t port, struct rte_mempool *pool, uint16_t want_queues,
   // Toeplitz 与网卡一致；万一不一致，ST_RSS_MISMATCH 计数会暴露出来
   bool custom_key = info.hash_key_size == Steering::kRssKeyLen;
   bool key_ok = custom_key || info.hash_key_size == 0;
-  bool use_rss = nq > 1 && !force_sw && (rss_hf & RTE_ETH_RSS_IPV4) && key_ok;
+  bool use_rss = nw > 1 && !force_sw && (rss_hf & RTE_ETH_RSS_IPV4) && key_ok;
   if (use_rss) {
     conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
     conf.rx_adv_conf.rss_conf.rss_key = custom_key ? rss_key : nullptr;
@@ -126,7 +143,7 @@ int port_init(uint16_t port, struct rte_mempool *pool, uint16_t want_queues,
     conf.rxmode.mq_mode = RTE_ETH_MQ_RX_NONE;
   }
 
-  ret = rte_eth_dev_configure(port, nq, nq, &conf);
+  ret = rte_eth_dev_configure(port, plan.rx_queues, plan.tx_queues, &conf);
   if (ret != 0) {
     LOG_ERROR("Error configuring port %u: %s", port, rte_strerror(-ret));
     return ret;
@@ -139,12 +156,14 @@ int port_init(uint16_t port, struct rte_mempool *pool, uint16_t want_queues,
     return ret;
   }
   int socket = rte_eth_dev_socket_id(port);
-  for (uint16_t q = 0; q < nq; ++q) {
+  for (uint16_t q = 0; q < plan.rx_queues; ++q) {
     ret = rte_eth_rx_queue_setup(port, q, nb_rxd, socket, nullptr, pool);
     if (ret < 0) {
       LOG_ERROR("Error setting up RX queue %u: %s", q, rte_strerror(-ret));
       return ret;
     }
+  }
+  for (uint16_t q = 0; q < plan.tx_queues; ++q) {
     ret = rte_eth_tx_queue_setup(port, q, nb_txd, socket, nullptr);
     if (ret < 0) {
       LOG_ERROR("Error setting up TX queue %u: %s", q, rte_strerror(-ret));
@@ -164,23 +183,24 @@ int port_init(uint16_t port, struct rte_mempool *pool, uint16_t want_queues,
     if (rte_eth_dev_info_get(port, &info) != 0)
       info.reta_size = 0;
     std::vector<uint16_t> reta;
-    if (!setup_reta(port, info.reta_size, nq, reta)) {
-      reta.resize(nq);
-      for (uint16_t i = 0; i < nq; ++i)
+    if (!setup_reta(port, info.reta_size, nw, reta)) {
+      reta.resize(nw);
+      for (uint16_t i = 0; i < nw; ++i)
         reta[i] = i;
     }
     bool tcp_l4 = rss_hf & RTE_ETH_RSS_NONFRAG_IPV4_TCP;
     bool udp_l4 = rss_hf & RTE_ETH_RSS_NONFRAG_IPV4_UDP;
-    steering.init_hw(nq, rss_key, reta.data(),
+    steering.init_hw(nw, rss_key, reta.data(),
                      static_cast<uint16_t>(reta.size()), tcp_l4, udp_l4);
-    LOG_INFO("RSS: %u queues, reta_size %zu, hash 0x%lx (tcp ports %s, udp "
-             "ports %s)",
-             nq, reta.size(), rss_hf, tcp_l4 ? "yes" : "no",
-             udp_l4 ? "yes" : "no");
+    LOG_INFO("RSS: %u RX / %u TX queues, reta_size %zu, hash 0x%lx (tcp ports "
+             "%s, udp ports %s)",
+             plan.rx_queues, plan.tx_queues, reta.size(), rss_hf,
+             tcp_l4 ? "yes" : "no", udp_l4 ? "yes" : "no");
   } else {
-    steering.init_sw(nq);
-    LOG_INFO("%u queue(s), software steering%s", nq,
-             nq > 1 ? " (NIC has no usable RSS)" : "");
+    steering.init_sw(nw);
+    LOG_INFO("%u RX / %u TX queues, software steering%s", plan.rx_queues,
+             plan.tx_queues,
+             force_sw ? "" : (nw > 1 ? " (NIC has no usable RSS)" : ""));
   }
 
   wait_link(port);

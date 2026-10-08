@@ -22,6 +22,8 @@ option(BUILD_TESTS    "Build unit tests (ctest)" ON)
 # DPDK（通过 pkg-config 查找；DPDK 不在默认路径时设置 PKG_CONFIG_PATH）
 # ============================================================================
 find_package(PkgConfig REQUIRED)
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
 pkg_check_modules(DPDK IMPORTED_TARGET libdpdk)
 if(NOT DPDK_FOUND)
     message(FATAL_ERROR
@@ -56,7 +58,7 @@ list(REMOVE_ITEM CORE_SOURCES "${CMAKE_SOURCE_DIR}/src/main.cpp")
 
 add_library(l4lb_core STATIC ${CORE_SOURCES})
 target_include_directories(l4lb_core PUBLIC ${CMAKE_SOURCE_DIR}/include)
-target_link_libraries(l4lb_core PUBLIC PkgConfig::DPDK pthread)
+target_link_libraries(l4lb_core PUBLIC PkgConfig::DPDK Threads::Threads)
 
 add_executable(l4lb src/main.cpp)
 target_link_libraries(l4lb PRIVATE l4lb_core)

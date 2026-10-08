@@ -75,7 +75,9 @@ CMake 选项：`-DL4LB_NATIVE=OFF`（不用 -march=native）、`-DL4LB_SANITIZE=
 ```bash
 # 先检查配置
 ./build/l4lb -- --lb-config config/lb.conf --check-config
-# 4 个 lcore（网卡队列数必须 >= lcore 数）
+# pipeline（配置 dataplane = pipeline）：lcore 1 收包分发，lcore 2、3 两个 worker
+sudo ./build/l4lb -l 1-3 -- --lb-config config/lb.conf
+# rtc（dataplane = rtc，网卡有 RSS 时）：4 个 worker，网卡 TX 队列数必须 >= lcore 数 + 1
 sudo ./build/l4lb -l 1-4 -- --lb-config config/lb.conf
 ```
 
@@ -104,6 +106,15 @@ scripts/l4lbctl.py weight 2 0       # RS 2 排空：不接新连接，已有连�
 scripts/l4lbctl.py disable 2        # RS 2 下线：已有连接也断开
 scripts/l4lbctl.py add 0 192.168.154.134:80:50
 scripts/l4lbctl.py del 2
+```
+
+### 日志
+
+默认写入 `/data/logs/l4/l4lb.log`（`[global] log_dir`，`--log-dir` 覆盖，留空只输出终端），DPDK 自身日志以 `[dpdk]` 标记写入同一文件。超过 `log_max_size_mb` 后轮转为 `l4lb.log.1 ~ .N`；`kill -HUP` 重新打开文件，可配合 logrotate。
+
+```bash
+tail -f /data/logs/l4/l4lb.log
+grep 'Sessions:' /data/logs/l4/l4lb.log   # 每 10 秒一次的统计
 ```
 
 ## 五、测试

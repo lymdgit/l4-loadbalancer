@@ -2,11 +2,16 @@
  * @file context.h
  * @brief 数据面上下文：每个 worker 的私有状态 + 全局共享对象
  *
+ * 线程（docs/pipeline改造.md）：
+ *   worker    每个 lcore 一个（pipeline 模式下 main lcore 除外），只做转发
+ *   receiver  pipeline 模式下的 main lcore：收包，按 owner 放进 worker 的 rx_ring
+ *   master    普通线程：ARP / 邻居表 / 健康检查 / 周期统计，独占最后一个 TX 队列
+ *
  * WorkerCtx 只由所属 worker 访问（统计计数器除外，允许其他线程只读）；
  * Dataplane 中的对象在启动时创建，运行期间只读或自带并发控制：
  *   steering / route / cfg    只读
  *   neigh                     master 写，worker 无锁读
- *   snapshots                 控制线程写，worker 通过 RCU 读
+ *   snapshots                 控制线程写，worker / master 通过 RCU 读
  *   master_ring / health_ring 多生产者 / 单消费者 ring
  *
  * @author L4 Load Balancer Project
@@ -44,6 +49,10 @@ constexpr uint16_t TX_RING_SIZE = 4096;
 constexpr unsigned MBUF_CACHE_SIZE = 512;
 constexpr uint16_t BURST_SIZE = 64;
 constexpr unsigned REDIRECT_RING_SIZE = 4096;
+constexpr unsigned RX_RING_ELEMS = 4096;   ///< pipeline：receiver -> worker
+/// master 线程的 RCU thread id（lcore id 都小于 RTE_MAX_LCORE）
+constexpr unsigned kMasterRcuId = RTE_MAX_LCORE;
+constexpr unsigned kRcuMaxThreads = RTE_MAX_LCORE + 1;
 constexpr unsigned MASTER_RING_SIZE = 8192;
 
 /// TX 批量缓冲
@@ -72,20 +81,29 @@ struct MasterEvent {
 };
 static_assert(sizeof(MasterEvent) % 4 == 0, "ring element size");
 
-/// 一个 worker（一个 lcore + 一组独占的 RX/TX 队列）
+/// 一个 worker（一个 lcore + 独占的 TX 队列；rtc 模式下还独占同号 RX 队列）
 struct WorkerCtx {
-  uint16_t idx = 0;      ///< worker 下标，等于队列号；0 是 master
+  uint16_t idx = 0;      ///< worker 下标，等于 TX 队列号
   unsigned lcore_id = 0;
   SessionTable sessions;
   struct rte_ring *redirect_ring = nullptr; ///< 其他 worker 转交来的包
+  struct rte_ring *rx_ring = nullptr;       ///< pipeline：receiver 分发来的包
   TxBuffer tx;
   WorkerStats stats;
   std::vector<uint32_t> lip_cursor; ///< 每个 LIP 的 SNAT 端口游标
   uint32_t lip_rr = 0;              ///< LIP 轮询
   uint64_t now_tick = 1;            ///< 秒级时间（启动时为 1）
   uint64_t now_ms = 0;
+};
 
-  bool is_master() const { return idx == 0; }
+
+
+/// 网卡统计（rte_eth_stats_get），由 master 线程定期刷新，其他线程只读
+struct NicStats {
+  std::atomic<uint64_t> ipackets{0}, opackets{0};
+  std::atomic<uint64_t> imissed{0};   ///< 网卡 RX 队列满丢弃（收包跟不上）
+  std::atomic<uint64_t> ierrors{0}, oerrors{0};
+  std::atomic<uint64_t> rx_nombuf{0}; ///< mbuf 不够丢弃
 };
 
 /// 全局数据面对象
@@ -108,6 +126,13 @@ struct Dataplane {
 
   uint16_t num_workers = 0;
   std::array<WorkerCtx *, RTE_MAX_LCORE> workers{};
+
+  bool pipeline = false;      ///< DataplaneMode::PIPELINE
+  uint16_t num_rx_queues = 0; ///< rtc：worker i 轮询 q % num_workers == i 的队列
+  /// master 线程的上下文：idx = 它独占的 TX 队列（= num_workers），不建会话表
+  WorkerCtx *master = nullptr;
+  WorkerStats *receiver_stats = nullptr; ///< pipeline 模式下有效
+  NicStats nic;
 
   uint64_t tsc_hz = 0;
   uint64_t start_tsc = 0;

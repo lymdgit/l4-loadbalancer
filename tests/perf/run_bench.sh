@@ -10,7 +10,8 @@
 # 依赖：wrk（必需），wrk2（可选，测固定速率下的尾延迟）
 # 可调参数（环境变量）：
 #   DURATION=30  THREADS=4  CONNS="100 1000 2000"  RATES="20000 50000 80000"
-#   REPEAT=3     LB_HOST=root@192.168.154.142（可选，压测前后抓取 LB 统计）
+#   REPEAT=3     LB_HOST=root@192.168.154.142（可选，压测前后和每项之间抓取 LB 统计）
+#   LB_DIR=/root/l4-loadbalancer（LB 上的仓库路径）
 #
 # 结果写到 tests/perf/results/<时间>-<标签>/，summary.csv 汇总每一项的均值。
 # 同一套参数分别测：直连 RS、DR、FULLNAT，以及不同核数，便于对比。
@@ -25,6 +26,7 @@ CONNS=${CONNS:-"100 1000 2000"}
 RATES=${RATES:-"20000 50000 80000"}
 REPEAT=${REPEAT:-3}
 LB_HOST=${LB_HOST:-}
+LB_DIR=${LB_DIR:-/root/l4-loadbalancer}
 
 command -v wrk >/dev/null || { echo "wrk not found"; exit 1; }
 OUT="$(dirname "$0")/results/$(date +%Y%m%d-%H%M%S)-$LABEL"
@@ -44,7 +46,8 @@ echo "test,param,run,requests_per_sec,latency_avg_ms,latency_p99_ms,errors" > "$
 
 lb_stats() {
   [ -n "$LB_HOST" ] || return 0
-  ssh -o BatchMode=yes "$LB_HOST" "python3 /usr/local/bin/l4lbctl.py stats -v" \
+  ssh -o BatchMode=yes "$LB_HOST" \
+    "python3 $LB_DIR/scripts/l4lbctl.py stats -v; python3 $LB_DIR/scripts/l4lbctl.py rate" \
     > "$OUT/lb_stats_$1.txt" 2>&1 || true
 }
 
@@ -76,6 +79,7 @@ run() { # name param run cmd...
   echo ">> $name $param run $i"
   "$@" > "$f" 2>&1 || true
   echo "$name,$param,$i,$(parse "$f")" >> "$SUMMARY"
+  lb_stats "${name}_${param}_$i"  # 每项结束时 LB 的计数、速率和忙碌率
 }
 
 lb_stats before

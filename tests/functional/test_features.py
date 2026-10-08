@@ -1,6 +1,10 @@
 """Functional tests for stage 3/4 features (imported by run_tests.py)."""
+import os
+import shutil
+import signal
 import socket
 import struct
+import tempfile
 import time
 
 from harness import LB
@@ -346,5 +350,34 @@ def control_plane(binary):
         expect("Sessions: active" in lb.ctl("stats"), "stats")
 
 
+# ---------------------------------------------------------------------------
+# 日志文件（docs/日志改造方案.md）
+# ---------------------------------------------------------------------------
+def log_file(binary):
+    """log_dir: own + DPDK logs land in l4lb.log, SIGHUP reopens, flushed on exit"""
+    d = tempfile.mkdtemp(prefix="l4lb_log_")
+    path = os.path.join(d, "logs", "l4lb.log")
+    conf = MULTI_CONF.replace("mode = nat", "mode = nat\nlog_dir = %s/logs\nlog_stderr = off" % d)
+    try:
+        with LB(binary, conf=conf, ready_file=path) as lb:
+            # stderr 只有打开文件之前的日志
+            expect("is running" not in lb.read_log(), "log_stderr = off ignored")
+            text = open(path, errors="replace").read()
+            expect("is running" in text, "no startup log in file:\n" + text[-800:])
+            expect("[dpdk] " in text, "DPDK logs not captured")
+            os.rename(path, path + ".old")
+            lb.proc.send_signal(signal.SIGHUP)
+            time.sleep(1.5)
+            expect(lb.proc.poll() is None, "SIGHUP killed the process")
+            expect(os.path.exists(path), "SIGHUP did not reopen the log file")
+            rc = lb.stop(sig=signal.SIGTERM)
+            expect(rc == 0, "rc=%s" % rc)
+        text = open(path, errors="replace").read()
+        expect("log file reopened" in text and "Final Statistics" in text,
+               "missing shutdown logs:\n" + text[-800:])
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 ALL = [tcp_state_machine, local_ips_and_services, toa_and_timestamp, icmp_errors,
-       neighbor_resolution, gateway_routing, health_check, control_plane]
+       neighbor_resolution, gateway_routing, health_check, control_plane, log_file]
