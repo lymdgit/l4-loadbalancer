@@ -82,15 +82,39 @@ enum Stat : uint32_t {
 
 const char *stat_name(Stat id);
 
+/// 字节计数 ID（与包计数分开，见 docs/pps方案.md）；名字表见 byte_stat_name()
+enum ByteStat : uint32_t {
+  BS_RX,      ///< 网卡收包（rtc: worker，pipeline: receiver）
+  BS_TX,      ///< 网卡发出（tx_burst 成功的部分）
+  BS_FWD_IN,  ///< 转发 Client -> RS
+  BS_FWD_OUT, ///< 转发 RS -> Client（FULLNAT）
+  BS_COUNT
+};
+
+const char *byte_stat_name(ByteStat id);
+
+/// 每个 RS 的计数（每个 worker 一份，按 RS id 索引，只有所属 worker 写）
+struct RsCounters {
+  std::atomic<uint64_t> conns{0};
+  std::atomic<uint64_t> pkts_in{0}, bytes_in{0};   ///< Client -> RS
+  std::atomic<uint64_t> pkts_out{0}, bytes_out{0}; ///< RS -> Client（FULLNAT）
+};
+
+/// RS 计数数组的容量（RS id 上限，id 不复用）
+constexpr uint32_t kMaxRsCounters = 16384;
+
 /// 一个 worker 的全部计数器
 struct alignas(RTE_CACHE_LINE_SIZE) WorkerStats {
   std::array<std::atomic<uint64_t>, ST_COUNT> c{};
+  std::array<std::atomic<uint64_t>, BS_COUNT> bytes{};
   /// 忙碌时间：有包处理的那些轮次花掉的 TSC 周期（忙轮询下 CPU 永远 100%，
   /// 用它除以经过的 TSC 得到真实负载）
   std::atomic<uint64_t> busy_tsc{0};
 
   void add(Stat id, uint64_t n = 1) { stat_add(c[id], n); }
   uint64_t get(Stat id) const { return stat_get(c[id]); }
+  void add_bytes(ByteStat id, uint64_t n) { stat_add(bytes[id], n); }
+  uint64_t get_bytes(ByteStat id) const { return stat_get(bytes[id]); }
   void add_busy(uint64_t cycles) { stat_add(busy_tsc, cycles); }
   uint64_t busy() const { return stat_get(busy_tsc); }
 };
@@ -98,7 +122,9 @@ struct alignas(RTE_CACHE_LINE_SIZE) WorkerStats {
 /// 汇总后的快照
 struct StatsTotal {
   std::array<uint64_t, ST_COUNT> c{};
+  std::array<uint64_t, BS_COUNT> bytes{};
   uint64_t operator[](Stat id) const { return c[id]; }
+  uint64_t operator[](ByteStat id) const { return bytes[id]; }
   uint64_t drops() const;
 };
 

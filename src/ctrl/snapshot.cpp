@@ -247,6 +247,20 @@ void SnapshotManager::publish() {
   }
 }
 
+std::vector<SnapshotManager::ServiceInfo> SnapshotManager::list() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  std::vector<ServiceInfo> out;
+  for (size_t i = 0; i < services_.size(); ++i) {
+    const auto &ds = services_[i];
+    ServiceInfo si{static_cast<uint16_t>(i), ds.conf.name, ds.conf.vip,
+                   ds.conf.port, ds.conf.proto, {}};
+    for (const auto &r : ds.rs)
+      si.rs.push_back({r.id, r.conf.ip, r.conf.port});
+    out.push_back(std::move(si));
+  }
+  return out;
+}
+
 std::string SnapshotManager::describe() const {
   std::lock_guard<std::mutex> lock(mu_);
   std::ostringstream os;

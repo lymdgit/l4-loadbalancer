@@ -83,12 +83,15 @@ uint16_t dispatch_rx_queue(const Dispatcher &d, uint16_t queue,
   const uint16_t nw = g_dp.num_workers;
   struct rte_mbuf *groups[kMaxPipelineWorkers][BURST_SIZE];
   uint16_t counts[kMaxPipelineWorkers] = {};
+  uint64_t bytes = 0;
   for (uint16_t i = 0; i < nb; ++i) {
     struct rte_mbuf *m = bufs[i];
+    bytes += rte_pktmbuf_pkt_len(m);
     uint16_t to = d.target(rte_pktmbuf_mtod(m, const uint8_t *),
                            rte_pktmbuf_data_len(m));
     groups[to][counts[to]++] = m;
   }
+  stats.add_bytes(BS_RX, bytes);
   for (uint16_t w = 0; w < nw; ++w) {
     if (counts[w] == 0)
       continue;

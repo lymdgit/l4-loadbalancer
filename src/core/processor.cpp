@@ -101,6 +101,28 @@ bool resolve_client_mac(Session &s, MacAddr &out) {
                      on_link ? s.cli_src_mac : MacAddr{}, out);
 }
 
+/// 转发成功的计数：全局包数 / 字节数 + 会话所属 RS 的计数（docs/pps方案.md）
+/// 包长在改写之后取，即实际发出的长度（TOA / 去 timestamp 会改变长度）
+inline void count_fwd_in(WorkerCtx &w, const Session *s,
+                         const struct rte_mbuf *m) {
+  uint32_t len = rte_pktmbuf_pkt_len(m);
+  w.stats.add(ST_FWD_IN);
+  w.stats.add_bytes(BS_FWD_IN, len);
+  RsCounters &c = w.rs_stats[s->rs_id];
+  stat_add(c.pkts_in);
+  stat_add(c.bytes_in, len);
+}
+
+inline void count_fwd_out(WorkerCtx &w, const Session *s,
+                          const struct rte_mbuf *m) {
+  uint32_t len = rte_pktmbuf_pkt_len(m);
+  w.stats.add(ST_FWD_OUT);
+  w.stats.add_bytes(BS_FWD_OUT, len);
+  RsCounters &c = w.rs_stats[s->rs_id];
+  stat_add(c.pkts_out);
+  stat_add(c.bytes_out, len);
+}
+
 void close_session(WorkerCtx &w, Session *s) {
   w.sessions.remove(s);
   w.stats.add(ST_SESS_CLOSED);
@@ -198,6 +220,7 @@ Session *new_session(WorkerCtx &w, const Snapshot &snap, const Service &svc,
   if (snap.mode == ForwardMode::NAT && tcp && cfg.toa)
     s->flags |= SF_TOA_PENDING;
   w.stats.add(ST_SESS_NEW);
+  stat_add(w.rs_stats[rs.id].conns);
 
   // FULLNAT 回程要发给客户端：直连客户端的 MAC 提示给邻居表，避免首个回包等 ARP
   if (snap.mode == ForwardMode::NAT && g_dp.route.on_link(tuple.src_ip)) {
@@ -276,7 +299,7 @@ Result handle_inbound(WorkerCtx &w, const Snapshot &snap, const Service &svc,
 
   if (snap.mode == ForwardMode::DR) {
     dr_rewrite(m, g_dp.local_mac, rs_mac);
-    w.stats.add(ST_FWD_IN);
+    count_fwd_in(w, s, m);
     return send();
   }
 
@@ -311,7 +334,7 @@ Result handle_inbound(WorkerCtx &w, const Snapshot &snap, const Service &svc,
     w.stats.add(ST_TOA_ADDED);
   if (out.toa_no_room)
     w.stats.add(ST_TOA_NO_ROOM);
-  w.stats.add(ST_FWD_IN);
+  count_fwd_in(w, s, m);
   return send();
 }
 
@@ -362,7 +385,7 @@ Result handle_return(WorkerCtx &w, const Snapshot &snap, struct rte_mbuf *m,
   RewriteOutcome out;
   if (nat_rewrite(m, meta, rw, opt, out) != RewriteResult::OK)
     return drop(ST_DROP_TTL);
-  w.stats.add(ST_FWD_OUT);
+  count_fwd_out(w, s, m);
   return send();
 }
 

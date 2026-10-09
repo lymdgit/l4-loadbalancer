@@ -277,6 +277,12 @@ int main(int argc, char *argv[]) {
     w->idx = i;
     w->lcore_id = lcores[i];
     w->lip_cursor.assign(g_dp.cfg.local_ips.size(), 0);
+    // RS 计数：所有 RS id 预先分配（RS id 不复用，上限 kMaxRsId）
+    w->rs_stats = static_cast<RsCounters *>(
+        rte_zmalloc_socket("rs_stats", sizeof(RsCounters) * kMaxRsCounters,
+                           RTE_CACHE_LINE_SIZE, g_dp.socket_id));
+    if (!w->rs_stats)
+      return fail("Failed to allocate RS counters");
     char name[32];
     snprintf(name, sizeof(name), "sess_%u", i);
     if (!w->sessions.init(name, per_worker, g_dp.socket_id, 1))
@@ -395,6 +401,7 @@ int main(int argc, char *argv[]) {
         rte_pktmbuf_free(static_cast<struct rte_mbuf *>(m));
       rte_ring_free(r);
     }
+    rte_free(w->rs_stats);
     w->~WorkerCtx();
     rte_free(w);
   }

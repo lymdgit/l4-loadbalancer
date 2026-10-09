@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <ctime>
 #include <mutex>
 #include <sstream>
 #include <vector>
@@ -29,8 +30,16 @@ void tx_flush(WorkerCtx &w) {
   TxBuffer &b = w.tx;
   if (b.count == 0)
     return;
+  // 发送前取长度：tx_burst 成功后 mbuf 归驱动所有，不能再访问
+  uint32_t lens[BURST_SIZE];
+  for (uint16_t i = 0; i < b.count; ++i)
+    lens[i] = rte_pktmbuf_pkt_len(b.pkts[i]);
   uint16_t nb = rte_eth_tx_burst(g_dp.port_id, w.idx, b.pkts, b.count);
+  uint64_t bytes = 0;
+  for (uint16_t i = 0; i < nb; ++i)
+    bytes += lens[i];
   w.stats.add(ST_TX, nb);
+  w.stats.add_bytes(BS_TX, bytes);
   if (unlikely(nb < b.count)) {
     w.stats.add(ST_TX_FULL, b.count - nb);
     for (uint16_t i = nb; i < b.count; ++i)
@@ -107,6 +116,8 @@ std::string format_stats(bool verbose) {
   os << (any || t[ST_TX_FULL] || t[ST_DROP_RX_RING] ? "" : " none") << "\n";
   os << "NIC: ipackets " << g_dp.nic.ipackets.load(std::memory_order_relaxed)
      << ", opackets " << g_dp.nic.opackets.load(std::memory_order_relaxed)
+     << ", ibytes " << g_dp.nic.ibytes.load(std::memory_order_relaxed)
+     << ", obytes " << g_dp.nic.obytes.load(std::memory_order_relaxed)
      << ", imissed " << g_dp.nic.imissed.load(std::memory_order_relaxed)
      << ", ierrors " << g_dp.nic.ierrors.load(std::memory_order_relaxed)
      << ", oerrors " << g_dp.nic.oerrors.load(std::memory_order_relaxed)
@@ -162,6 +173,21 @@ std::string pct(uint64_t busy, uint64_t elapsed) {
   return b;
 }
 
+/// 比特率：bytes 是字节数
+std::string bps(uint64_t bytes, double sec) {
+  char b[32];
+  double r = sec > 0 ? bytes * 8.0 / sec : 0;
+  if (r >= 1e9)
+    snprintf(b, sizeof(b), "%.2f Gbps", r / 1e9);
+  else if (r >= 1e6)
+    snprintf(b, sizeof(b), "%.1f Mbps", r / 1e6);
+  else if (r >= 1e3)
+    snprintf(b, sizeof(b), "%.1f Kbps", r / 1e3);
+  else
+    snprintf(b, sizeof(b), "%.0f bps", r);
+  return b;
+}
+
 std::string rate(uint64_t n, double sec) {
   char b[32];
   double r = sec > 0 ? n / sec : 0;
@@ -198,6 +224,8 @@ void nic_stats_update() {
     return;
   g_dp.nic.ipackets.store(st.ipackets, std::memory_order_relaxed);
   g_dp.nic.opackets.store(st.opackets, std::memory_order_relaxed);
+  g_dp.nic.ibytes.store(st.ibytes, std::memory_order_relaxed);
+  g_dp.nic.obytes.store(st.obytes, std::memory_order_relaxed);
   g_dp.nic.imissed.store(st.imissed, std::memory_order_relaxed);
   g_dp.nic.ierrors.store(st.ierrors, std::memory_order_relaxed);
   g_dp.nic.oerrors.store(st.oerrors, std::memory_order_relaxed);
@@ -225,14 +253,16 @@ std::string perf_report_tick(uint64_t now_tsc) {
   const uint64_t el = cur.tsc - prev.tsc;
   const double sec = static_cast<double>(el) / g_dp.tsc_hz;
   auto d = [&](Stat s) { return cur.total[s] - prev.total[s]; };
+  auto db = [&](ByteStat s) { return cur.total[s] - prev.total[s]; };
   uint64_t drops = cur.total.drops() - prev.total.drops();
 
   std::ostringstream os;
   char head[64];
   snprintf(head, sizeof(head), "=== Perf (last %.1fs) ===\n", sec);
   os << head;
-  os << "Rate: rx " << rate(d(ST_RX), sec) << " pps, tx " << rate(d(ST_TX), sec)
-     << " pps, fwd in " << rate(d(ST_FWD_IN), sec) << " pps, fwd out "
+  os << "Rate: rx " << rate(d(ST_RX), sec) << " pps " << bps(db(BS_RX), sec)
+     << ", tx " << rate(d(ST_TX), sec) << " pps " << bps(db(BS_TX), sec)
+     << ", fwd in " << rate(d(ST_FWD_IN), sec) << " pps, fwd out "
      << rate(d(ST_FWD_OUT), sec) << " pps, new sess "
      << rate(d(ST_SESS_NEW), sec) << " /s, drops " << rate(drops, sec)
      << " /s\n";
@@ -255,6 +285,160 @@ std::string perf_report_tick(uint64_t now_tsc) {
   std::lock_guard<std::mutex> lk(g_perf_mu);
   g_perf_last = out;
   return out;
+}
+
+// ============================================================================
+// 包 / 字节计数查询（docs/pps方案.md）
+// ============================================================================
+
+namespace {
+
+uint64_t now_realtime_ns() {
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + ts.tv_nsec;
+}
+
+/// 人读的大数：1234567 -> 1.23M
+std::string human(uint64_t n) {
+  char b[32];
+  if (n >= 1000000000ull)
+    snprintf(b, sizeof(b), "%.2fG", n / 1e9);
+  else if (n >= 1000000)
+    snprintf(b, sizeof(b), "%.2fM", n / 1e6);
+  else if (n >= 1000)
+    snprintf(b, sizeof(b), "%.1fk", n / 1e3);
+  else
+    snprintf(b, sizeof(b), "%lu", n);
+  return b;
+}
+
+} // namespace
+
+std::string format_counters() {
+  // 网卡计数当场读取，保证与软件计数是同一时刻的快照（误差为一次调用的时间）
+  nic_stats_update();
+  const uint64_t ts = now_realtime_ns();
+  const uint64_t up_ns = static_cast<uint64_t>(
+      static_cast<double>(rte_get_tsc_cycles() - g_dp.start_tsc) * 1e9 /
+      g_dp.tsc_hz);
+  StatsTotal t = stats_total();
+  const NicStats &n = g_dp.nic;
+  auto ld = [](const std::atomic<uint64_t> &v) {
+    return v.load(std::memory_order_relaxed);
+  };
+
+  std::ostringstream os;
+  // key 名字固定，供脚本解析（scripts/l4lbctl.py delta）；值均为启动以来的累计值
+  os << "time_ns " << ts << "\n"
+     << "uptime_ns " << up_ns << "\n"
+     << "mode " << (g_dp.cfg.mode == ForwardMode::NAT ? "fullnat" : "dr") << "\n"
+     << "dataplane " << (g_dp.pipeline ? "pipeline" : "rtc") << "\n"
+     << "workers " << g_dp.num_workers << "\n"
+     << "nic_ipackets " << ld(n.ipackets) << "\n"
+     << "nic_opackets " << ld(n.opackets) << "\n"
+     << "nic_ibytes " << ld(n.ibytes) << "\n"
+     << "nic_obytes " << ld(n.obytes) << "\n"
+     << "nic_imissed " << ld(n.imissed) << "\n"
+     << "nic_ierrors " << ld(n.ierrors) << "\n"
+     << "nic_oerrors " << ld(n.oerrors) << "\n"
+     << "nic_rx_nombuf " << ld(n.rx_nombuf) << "\n"
+     << "rx_pkts " << t[ST_RX] << "\n"
+     << "rx_bytes " << t[BS_RX] << "\n"
+     << "tx_pkts " << t[ST_TX] << "\n"
+     << "tx_bytes " << t[BS_TX] << "\n"
+     << "fwd_in_pkts " << t[ST_FWD_IN] << "\n"
+     << "fwd_in_bytes " << t[BS_FWD_IN] << "\n"
+     << "fwd_out_pkts " << t[ST_FWD_OUT] << "\n"
+     << "fwd_out_bytes " << t[BS_FWD_OUT] << "\n"
+     << "conns_new " << t[ST_SESS_NEW] << "\n"
+     << "conns_active " << sessions_active(t) << "\n"
+     << "drops " << t.drops() << "\n";
+  for (unsigned i = 0; i < ST_COUNT; ++i)
+    os << "stat." << stat_name(static_cast<Stat>(i)) << " " << t.c[i] << "\n";
+  // 各线程忙碌时间（有包处理的轮次）和处理的包数：delta 据此算区间忙碌率、每包周期
+  auto busy_ns = [](const WorkerStats &st) {
+    return static_cast<uint64_t>(static_cast<double>(st.busy()) * 1e9 /
+                                 g_dp.tsc_hz);
+  };
+  os << "tsc_hz " << g_dp.tsc_hz << "\n";
+  if (const WorkerStats *r = g_dp.receiver_stats)
+    os << "thread.receiver.busy_ns " << busy_ns(*r) << "\n"
+       << "thread.receiver.pkts " << r->get(ST_RX) << "\n";
+  for (uint16_t i = 0; i < g_dp.num_workers; ++i) {
+    const WorkerStats &st = g_dp.workers[i]->stats;
+    os << "thread.worker" << i << ".busy_ns " << busy_ns(st) << "\n"
+       << "thread.worker" << i << ".pkts "
+       << st.get(g_dp.pipeline ? ST_RING_IN : ST_RX) + st.get(ST_REDIRECT_IN)
+       << "\n";
+  }
+  for (const auto &svc : g_dp.snapshots.list()) {
+    RsTotal sum;
+    std::ostringstream rs_os;
+    for (const auto &r : svc.rs) {
+      RsTotal c = rs_total(r.id);
+      sum.conns += c.conns;
+      sum.pkts_in += c.pkts_in;
+      sum.bytes_in += c.bytes_in;
+      sum.pkts_out += c.pkts_out;
+      sum.bytes_out += c.bytes_out;
+      std::string k = "rs." + std::to_string(r.id) + ".";
+      rs_os << k << "svc " << svc.idx << "\n"
+            << k << "addr " << ip_to_string(r.ip) << ":" << r.port << "\n"
+            << k << "conns " << c.conns << "\n"
+            << k << "pkts_in " << c.pkts_in << "\n"
+            << k << "bytes_in " << c.bytes_in << "\n"
+            << k << "pkts_out " << c.pkts_out << "\n"
+            << k << "bytes_out " << c.bytes_out << "\n";
+    }
+    std::string k = "svc." + std::to_string(svc.idx) + ".";
+    os << k << "name " << svc.name << "\n"
+       << k << "addr " << ip_to_string(svc.vip) << ":" << svc.port << "/"
+       << (svc.proto == 17 ? "udp" : "tcp") << "\n"
+       << k << "conns " << sum.conns << "\n"
+       << k << "pkts_in " << sum.pkts_in << "\n"
+       << k << "bytes_in " << sum.bytes_in << "\n"
+       << k << "pkts_out " << sum.pkts_out << "\n"
+       << k << "bytes_out " << sum.bytes_out << "\n"
+       << rs_os.str();
+  }
+  return os.str();
+}
+
+std::string format_rs_stats() {
+  std::ostringstream os;
+  char line[256];
+  snprintf(line, sizeof(line), "%-34s %10s %10s %10s %10s %10s\n", "",
+           "conns", "inpkts", "inbytes", "outpkts", "outbytes");
+  os << line;
+  for (const auto &svc : g_dp.snapshots.list()) {
+    std::vector<std::pair<std::string, RsTotal>> rows;
+    RsTotal sum;
+    for (const auto &r : svc.rs) {
+      RsTotal c = rs_total(r.id);
+      sum.conns += c.conns;
+      sum.pkts_in += c.pkts_in;
+      sum.bytes_in += c.bytes_in;
+      sum.pkts_out += c.pkts_out;
+      sum.bytes_out += c.bytes_out;
+      rows.emplace_back("  -> rs " + std::to_string(r.id) + " " +
+                            ip_to_string(r.ip) + ":" + std::to_string(r.port),
+                        c);
+    }
+    std::string head = std::string(svc.proto == 17 ? "UDP " : "TCP ") +
+                       ip_to_string(svc.vip) + ":" + std::to_string(svc.port) +
+                       " " + svc.name;
+    rows.insert(rows.begin(), {head, sum});
+    for (const auto &row : rows) {
+      const RsTotal &c = row.second;
+      snprintf(line, sizeof(line), "%-34s %10s %10s %10s %10s %10s\n",
+               row.first.c_str(), human(c.conns).c_str(),
+               human(c.pkts_in).c_str(), human(c.bytes_in).c_str(),
+               human(c.pkts_out).c_str(), human(c.bytes_out).c_str());
+      os << line;
+    }
+  }
+  return os.str();
 }
 
 std::string perf_report_last() {
@@ -306,7 +490,11 @@ int worker_loop(void *arg) {
       for (uint16_t q : rxqs) {
         uint16_t nb = rte_eth_rx_burst(g_dp.port_id, q, bufs, BURST_SIZE);
         if (nb) {
+          uint64_t bytes = 0;
+          for (uint16_t i = 0; i < nb; ++i)
+            bytes += rte_pktmbuf_pkt_len(bufs[i]);
           w.stats.add(ST_RX, nb);
+          w.stats.add_bytes(BS_RX, bytes);
           for (uint16_t i = 0; i < nb; ++i)
             handle(w, snap, bufs[i], false);
         }

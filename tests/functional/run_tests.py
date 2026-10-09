@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Functional tests for l4lb. Usage: run_tests.py <l4lb binary> [-k substring]"""
+import os
 import re
 import sys
 import time
@@ -322,6 +323,83 @@ def pipeline_needs_two_lcores():
     with LB(BIN, lcores="11", dataplane="pipeline", qpairs=2) as lb:
         expect(lb.proc.wait(10) != 0, "should exit with error")
         expect("needs at least 2 lcores" in lb.read_log(), lb.log[-1500:])
+
+
+# ---------------------------------------------------------------------------
+# 包 / 字节计数（docs/pps方案.md）
+# ---------------------------------------------------------------------------
+def lbctl(lb, *args):
+    import subprocess
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "..", "..", "scripts", "l4lbctl.py")
+    # python 3.6：没有 capture_output / text
+    return subprocess.run([sys.executable, script, "-s", lb.ctl_path] + list(args),
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          universal_newlines=True, timeout=10).stdout
+
+
+@test
+def packet_counters():
+    """counters / stats -r / delta: per-RS packets and bytes match what was forwarded"""
+    import tempfile
+    with LB(BIN) as lb:
+        before = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False)
+        before.write(lb.ctl("counters"))
+        before.close()
+        out = to_rs(lb.xchg([syn(41000 + i) for i in range(20)]))
+        expect(len(out) == 20, "got %d" % len(out))
+        back = to_client(lb.xchg([reply_from(f) for f in out]))
+        expect(len(back) == 20, "got %d replies" % len(back))
+        c = dict(l.split(" ", 1) for l in lb.ctl("counters").splitlines())
+        b = dict(l.split(" ", 1) for l in open(before.name).read().splitlines())
+        d = lambda k: int(c[k]) - int(b[k])
+        expect(d("fwd_in_pkts") == 20 and d("fwd_out_pkts") == 20,
+               "fwd %d/%d" % (d("fwd_in_pkts"), d("fwd_out_pkts")))
+        expect(d("fwd_in_bytes") == sum(len(f.raw) for f in out),
+               "fwd_in_bytes %d vs %d" % (d("fwd_in_bytes"), sum(len(f.raw) for f in out)))
+        expect(d("fwd_out_bytes") == sum(len(f.raw) for f in back),
+               "fwd_out_bytes mismatch")
+        expect(d("rx_pkts") >= 40 and d("tx_pkts") >= 40 and d("rx_bytes") > 0 and
+               d("tx_bytes") > 0, "rx/tx counters")
+        # 两个 RS 的计数加起来等于总数，且与实际分配一致
+        per_rs = {1: 0, 2: 0}
+        for f in out:
+            per_rs[1 if f.dst == RS_IP[1] else 2] += 1
+        for rid in (1, 2):
+            expect(d("rs.%d.pkts_in" % rid) == per_rs[rid] and
+                   d("rs.%d.pkts_out" % rid) == per_rs[rid] and
+                   d("rs.%d.conns" % rid) == per_rs[rid],
+                   "rs %d: %d/%d/%d vs %d" % (rid, d("rs.%d.pkts_in" % rid),
+                                               d("rs.%d.pkts_out" % rid),
+                                               d("rs.%d.conns" % rid), per_rs[rid]))
+        expect(d("svc.0.pkts_in") == 20 and d("svc.0.conns") == 20, "service sum")
+        r = lb.ctl("stats -r")
+        expect("-> rs 1 10.0.0.11:80" in r and "-> rs 2 10.0.0.12:80" in r, r)
+        rep = lbctl(lb, "delta", before.name)
+        expect("total fwd" in rep and "40" in rep.split("total fwd")[1].split("\n")[0],
+               "delta report:\n" + rep)
+        csv = lbctl(lb, "delta", before.name, "--csv").strip().split(",")
+        expect(len(csv) == 12 and float(csv[0]) > 0, "delta csv: %r" % csv)
+        os.unlink(before.name)
+
+
+@test
+def packet_counters_dr():
+    """DR counters: only fwd_in counts (replies bypass the LB), per-RS in == forwarded"""
+    with LB(BIN, mode="dr") as lb:
+        b = dict(l.split(" ", 1) for l in lb.ctl("counters").splitlines())
+        out = [f for f in lb.xchg([syn(42000 + i) for i in range(16)] +
+                                  [eth(tcp(CLIENT, VIP, 42000 + i, 80, ACK)) for i in range(16)])
+               if f.dst_mac in RS_MAC.values()]
+        expect(len(out) == 32, "got %d" % len(out))
+        c = dict(l.split(" ", 1) for l in lb.ctl("counters").splitlines())
+        d = lambda k: int(c[k]) - int(b[k])
+        expect(d("fwd_in_pkts") == 32 and d("fwd_out_pkts") == 0,
+               "fwd %d/%d" % (d("fwd_in_pkts"), d("fwd_out_pkts")))
+        expect(d("fwd_in_bytes") == sum(len(f.raw) for f in out), "fwd_in_bytes")
+        expect(d("rs.1.pkts_in") + d("rs.2.pkts_in") == 32 and
+               d("rs.1.pkts_out") + d("rs.2.pkts_out") == 0 and
+               d("rs.1.conns") + d("rs.2.conns") == 16, "per-RS counters")
 
 
 @test

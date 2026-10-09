@@ -50,6 +50,11 @@ const char *stat_name(Stat id) {
   return id < ST_COUNT ? names[id] : "?";
 }
 
+const char *byte_stat_name(ByteStat id) {
+  static const char *const names[BS_COUNT] = {"rx", "tx", "fwd_in", "fwd_out"};
+  return id < BS_COUNT ? names[id] : "?";
+}
+
 uint64_t StatsTotal::drops() const {
   uint64_t n = c[ST_TX_FULL] + c[ST_DROP_RX_RING];
   for (unsigned i = ST_DROP_MALFORMED; i <= ST_DROP_OTHER; ++i)

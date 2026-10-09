@@ -56,7 +56,8 @@ bool parse_rs_spec(const std::string &spec, RsConf &rs) {
 
 const char *kHelp =
     "commands:\n"
-    "  stats [-v]                     counters\n"
+    "  stats [-v|-r]                  summary; -v per worker; -r per service/RS\n"
+    "  counters                       all raw counters (key value), for delta\n"
     "  rate                           last periodic rates and busy %\n"
     "  services                       services and real servers\n"
     "  weight <rs_id> <weight>        0 = drain (no new connections)\n"
@@ -81,8 +82,12 @@ std::string ControlServer::execute(const std::string &line) {
   std::string err;
   uint32_t id = 0, w = 0;
 
+  if (cmd == "stats" && a.size() > 1 && a[1] == "-r")
+    return format_rs_stats();
   if (cmd == "stats")
     return format_stats(a.size() > 1 && a[1] == "-v");
+  if (cmd == "counters")
+    return format_counters();
   if (cmd == "rate")
     return perf_report_last();
   if (cmd == "services")

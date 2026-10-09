@@ -47,8 +47,19 @@ std::string perf_report_tick(uint64_t now_tsc);
 /// 最近一次 perf_report_tick 的结果（任意线程）
 std::string perf_report_last();
 
-/// 刷新网卡统计（g_dp.nic）；只在 master 线程调用
+/// 刷新网卡统计（g_dp.nic）；master 线程每秒一次，统计命令执行时也会调用
 void nic_stats_update();
+
+/**
+ * @brief 全部原始计数，一行一个 "key value"（控制命令 counters）
+ *
+ * key 名字固定、值单调递增，带 time_ns 时间戳；压测前后各取一次相减即可
+ * 得到 PPS / bps（scripts/l4lbctl.py delta）。见 docs/pps方案.md。
+ */
+std::string format_counters();
+
+/// 按服务 / RS 的连接、包、字节计数（控制命令 stats -r，类似 ipvsadm -ln --stats）
+std::string format_rs_stats();
 
 } // namespace l4lb
 

@@ -20,6 +20,7 @@
 #define L4LB_CTRL_SNAPSHOT_H
 
 #include "common/config.h"
+#include "common/stats.h"
 #include "common/types.h"
 #include "lb/scheduler.h"
 #include <atomic>
@@ -32,7 +33,8 @@ struct rte_rcu_qsbr;
 
 namespace l4lb {
 
-constexpr uint32_t kMaxRsId = 1u << 16; ///< RS id 上限（不复用）
+/// RS id 上限（不复用）：与每个 worker 的 RS 计数数组大小一致
+constexpr uint32_t kMaxRsId = kMaxRsCounters;
 
 /// 快照中的一个 RS
 struct RsState {
@@ -134,6 +136,22 @@ public:
 
   /// 文本形式的服务/RS 列表（控制命令 services）
   std::string describe() const;
+
+  /// 当前的服务和 RS（统计命令按它汇总计数；已删除的 RS 不在其中）
+  struct ServiceInfo {
+    uint16_t idx;
+    std::string name;
+    IPv4Addr vip;
+    uint16_t port;
+    uint8_t proto;
+    struct Rs {
+      uint32_t id;
+      IPv4Addr ip;
+      uint16_t port;
+    };
+    std::vector<Rs> rs;
+  };
+  std::vector<ServiceInfo> list() const;
 
 private:
   struct DesiredRs {

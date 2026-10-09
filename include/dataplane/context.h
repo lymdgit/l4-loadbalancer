@@ -90,6 +90,7 @@ struct WorkerCtx {
   struct rte_ring *rx_ring = nullptr;       ///< pipeline：receiver 分发来的包
   TxBuffer tx;
   WorkerStats stats;
+  RsCounters *rs_stats = nullptr;    ///< [kMaxRsCounters]，按 RS id 索引
   std::vector<uint32_t> lip_cursor; ///< 每个 LIP 的 SNAT 端口游标
   uint32_t lip_rr = 0;              ///< LIP 轮询
   uint64_t now_tick = 1;            ///< 秒级时间（启动时为 1）
@@ -101,6 +102,7 @@ struct WorkerCtx {
 /// 网卡统计（rte_eth_stats_get），由 master 线程定期刷新，其他线程只读
 struct NicStats {
   std::atomic<uint64_t> ipackets{0}, opackets{0};
+  std::atomic<uint64_t> ibytes{0}, obytes{0};
   std::atomic<uint64_t> imissed{0};   ///< 网卡 RX 队列满丢弃（收包跟不上）
   std::atomic<uint64_t> ierrors{0}, oerrors{0};
   std::atomic<uint64_t> rx_nombuf{0}; ///< mbuf 不够丢弃
@@ -145,6 +147,12 @@ extern std::atomic<bool> g_running;
 
 /// 汇总所有 worker 的计数器
 StatsTotal stats_total();
+
+/// 一个 RS 在所有 worker 上的计数之和
+struct RsTotal {
+  uint64_t conns = 0, pkts_in = 0, bytes_in = 0, pkts_out = 0, bytes_out = 0;
+};
+RsTotal rs_total(uint32_t rs_id);
 
 /// 当前活跃会话数（所有 worker）
 uint64_t sessions_active(const StatsTotal &t);
