@@ -1,10 +1,40 @@
+==========================================================================
+现在的做法（以此为准）
+==========================================================================
+大页、驱动、网卡接管都由 scripts/setup_dpdk_env.sh 完成，重启后要重新执行（或安装成开机服务）：
+
+  sudo scripts/setup_dpdk_env.sh status                    # 查看网卡、驱动、大页
+  sudo DPDK_NIC=ens160 scripts/setup_dpdk_env.sh up        # 大页 + 加载驱动 + 绑定网卡
+  sudo DPDK_NIC=ens160 scripts/setup_dpdk_env.sh down      # 把网卡还给内核驱动
+  sudo DPDK_NIC=ens160 scripts/setup_dpdk_env.sh install   # 开机自动 up（uninstall 卸载）
+  sudo scripts/setup_dpdk_env.sh hugepages                 # 只配大页（功能测试只需要这一步）
+
+- 驱动：DPDK_DRIVER=auto，有 IOMMU 用 vfio-pci，没有 IOMMU（虚拟机常见）用 uio_pci_generic。
+  无 IOMMU 时强行用 vfio-pci 需要 ALLOW_NOIOMMU=1（关闭 DMA 隔离，只适合测试机）。
+  igb_uio 需要自己从 dpdk-kmods 仓库编译，再设置 DPDK_DRIVER=igb_uio IGB_UIO_KO=/path/igb_uio.ko。
+- 安全检查：带 IPv4 地址、承载默认路由或当前 SSH 会话的网卡，脚本拒绝接管，避免管理口失联。
+- 大页：默认每个 NUMA 节点 1024 个 2MB 页（HUGEPAGES 可改），挂载点默认 /dev/hugepages（systemd 已挂载）。
+- 参数也可以写进 /etc/l4lb/dpdk-env.conf。
+- dpdk-devbind.py 在 /root/dpvs/dpvs/dpdk-24.11/dpdklib/bin/ 下。
+
+本机（VMware VM，1 个 NUMA 节点，没有 IOMMU）：
+- ens33：e1000（0000:02:01.0），管理口，SSH 走这里，不能绑定
+- ens160：vmxnet3（0000:03:00.0），DPDK 使用，绑定 uio_pci_generic
+
+
+==========================================================================
+以下为早期的手动配置笔记（f-stack + igb_uio 环境），已过时，仅供理解原理
+==========================================================================
 零声是使用的sh脚本；这里是自己手动配置的
 2026.1.30 结合Gemini，梳理了一下，并深入了解了page、cache相关的知识
 
 DPDK绑定相关：
 # Compile DPDK 会生成对应的驱动程序，一会需要挂载
+# 【已过时】DPDK 20.11 起 igb_uio 已移出主仓库（移到 dpdk-kmods），enable_kmods 选项也已弃用，
+#  在 DPDK 24.11 上这条命令不会再生成 igb_uio.ko
 cd dpdk/
-# igb_uio is about 5% more efficient than vfio-pci, so continue using it.
+# 【更正】"igb_uio 比 vfio-pci 快 5%"没有依据：DPDK 收发包走用户态轮询，数据面性能与绑定哪个驱动无关，
+#  驱动的区别在于 DMA 隔离（IOMMU）和安全性
 meson -Denable_kmods=true build
 ninja -C build
 ninja -C build install
@@ -17,12 +47,14 @@ echo 1024 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
 
 # or NUMA (Linux only)
 # 如果有多CPU多内存条
+# 【注意】只写实际存在的节点；单节点机器上写 node1 会报错（setup_dpdk_env.sh 会遍历实际存在的节点）
 echo 1024 > /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages
 echo 1024 > /sys/devices/system/node/node1/hugepages/hugepages-2048kB/nr_hugepages
 
 
 # Using Hugepage with the DPDK (Linux only)
 #  这里是为了dpdk去分配和使用大页
+# 【注意】多数发行版的 systemd 已经把 hugetlbfs 挂在 /dev/hugepages，不需要再手动挂载
 mkdir /mnt/huge
 mount -t hugetlbfs nodev /mnt/huge
 
@@ -30,13 +62,10 @@ mount -t hugetlbfs nodev /mnt/huge
 #告诉内核我要准备搞驱动了，你提前准备好
 modprobe uio
 # 加载用户态的驱动，为了用户态直接操作硬件
+# 【本机不适用】路径是旧的 f-stack 环境；本机用 uio_pci_generic（modprobe uio_pci_generic）
 insmod /data/f-stack/dpdk/build/kernel/linux/igb_uio/igb_uio.ko
 # 查看状态
 dpdk-devbind.py --status
+# 【本机不适用】ens192 是旧环境的网卡名；本机 DPDK 网卡是 ens160，管理口 ens33 不能绑定
 ifconfig ens192 down
 ./dpdk-devbind.py --bind=igb_uio ens192
-
-
-
-
-

@@ -1,9 +1,18 @@
 # 反向会话表性能优化：从 unordered_map + spinlock 到 rte_hash (Lock-Free)
 
-> **注意：本文描述的是重构前的设计，已过时。** 现在会话表是 per-worker 的（见
-> `include/lb/session.h`），FULLNAT 回程包由 `dataplane/steering.h` 保证回到创建会话的核，
-> 会话表不再需要跨核共享和 RCU。RCU（QSBR）现在用于配置快照（`ctrl/snapshot.h`）
-> 和邻居表（`net/neigh.h`）的无锁读。本文保留作为学习记录。
+> **注意：本文第三、四节描述的是重构前的设计和代码，已过时**（`ReverseShard`、`lookup_reverse`、
+> `SessionManager` 等在当前源码中都不存在）。第二节的 rte_hash 原理和第五节 API 速查仍然有效。本文保留作为学习记录。
+>
+> 现在的实现：
+> - **会话表**是 per-worker 的（`include/lb/session.h`）：每个 worker 一张 rte_hash（`rte_hash_crc`、
+>   `RTE_HASH_EXTRA_FLAGS_EXT_TABLE`，不开 LF）+ 预分配会话数组 + 1 秒时间轮，只由所属 worker 访问，
+>   不需要锁，也不需要 RCU。FULLNAT 回程由 `dataplane/steering.h` 按 SNAT 端口回到创建会话的核；
+>   pipeline 模式下由收包核直接分发给 owner（`docs/pipeline改造.md`）。
+> - **RCU（QSBR）**用于两处无锁读：配置快照（`ctrl/snapshot.h`，`publish()` 后
+>   `rte_rcu_qsbr_synchronize` 再释放旧快照）和邻居表（`net/neigh.h`，rte_hash 开
+>   `RW_CONCURRENCY_LF`，用 `rte_hash_rcu_qsbr_add` 挂上 QSBR 延迟回收；只有 master 线程一个写者）。
+> - **RCU 读者**：各 worker（thread id = lcore_id）和 master 线程（`kMasterRcuId = RTE_MAX_LCORE`），
+>   QSBR 按 `kRcuMaxThreads = RTE_MAX_LCORE + 1` 初始化。pipeline 的收包核不读快照，不注册为读者。
 
 ## 一、为什么反向会话表必须换成 rte_hash？
 
@@ -12,7 +21,7 @@
 **当前问题**：你的 `shard.map.emplace(reverse_tuple, ReverseEntry{...})` 使用的是 `std::unordered_map`。
 在 C++ 中，每次往 `unordered_map` 里插入新元素，底层都会调用 `new/malloc` 去堆上动态分配一个节点（Node）。在 DPDK 每秒千万包的数据面热路径上做系统调用级别的内存分配是绝对的禁忌，不仅耗时，还会导致严重的锁竞争（glibc malloc 的锁）。
 
-**rte_hash 的优势**：`rte_hash` 初始化时必须绑定预先分配好的内存池（Mempool 或连续大内存）。它的插入（Add）就是利用现有内存，完全实现 **0 动态内存分配**。
+**rte_hash 的优势**：`rte_hash` 在创建时就按容量一次性分配好 bucket 和 key 存储（来自大页内存），插入（Add）只是使用这些预分配的槽位，运行时 **0 动态内存分配**。
 
 ```
 改造前（每次插入都 malloc）:
@@ -34,7 +43,7 @@
 
 **当前问题**：你在 `lookup_reverse`（反向查找）时使用了 `rte_spinlock_lock(&shard.lock)`，这意味着读操作和读操作之间也是互斥的。如果有多个 Worker 核同时收到属于同一个 Shard 哈希槽的回程报文，它们会相互堵塞等待自旋锁。
 
-**rte_hash 的优势**：`rte_hash` 基于 **Cuckoo Hash（布谷鸟哈希）**，并且支持 RCU（Read-Copy-Update）机制。你可以开启 `RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY_LF` 标志，实现多线程无锁读、带锁/无锁写。这样回程报文（只读查询）将完全不需要等待锁，性能呈指数级提升。
+**rte_hash 的优势**：`rte_hash` 基于 **Cuckoo Hash（布谷鸟哈希）**，并且支持 RCU（Read-Copy-Update）机制。你可以开启 `RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY_LF` 标志，实现多线程无锁读（写者之间仍需互斥：单写者，或者再加 `MULTI_WRITER_ADD`）。这样回程报文（只读查询）不再需要等待锁，读路径不再串行。
 
 ```
 改造前（spinlock 互斥读）:
@@ -76,14 +85,14 @@ rte_hash 的内存布局（连续、紧凑）:
 
 `rte_hash` 使用的核心算法是 **Cuckoo Hashing**：
 
-- 每个 key 有**两个候选位置**（由两个不同的 hash 函数计算）
+- 每个 key 有**两个候选桶**：一个 hash 值决定主桶，备选桶由主桶索引与 key 的签名异或得到（不是两个独立的 hash 函数）
 - 插入时，若位置 1 已满，将已有 key "踢"到其备选位置，腾出空间
 - 查找时，只需检查**最多 2 个位置**，时间复杂度 **O(1)**
 
 ```
-Hash1(key) ──→ Bucket A  ─┐
-                           ├─ 只查这 2 个位置，O(1)
-Hash2(key) ──→ Bucket B  ─┘
+hash(key) ──→ 主桶 A ──────────────┐
+                                    ├─ 只查这 2 个桶，O(1)
+     A ^ f(sig) ──→ 备选桶 B ───────┘
 ```
 
 ### 2.2 RCU (Read-Copy-Update) 无锁读机制
@@ -109,8 +118,8 @@ Hash2(key) ──→ Bucket B  ─┘
 
 **关键特性**：
 - **读路径完全无锁**：使用 `__atomic_load` 原子加载 signature，无需任何 mutex/spinlock
-- **写路径使用 CAS**：多个写者之间通过 Compare-And-Swap 保证一致性
-- **延迟回收**：删除的 key 不会立即释放 slot，等所有读者退出后才真正回收（避免 use-after-free）
+- **写路径**：LF 模式只保证"读和写可以并发"，多个写者之间仍需互斥（单写者，或者 `MULTI_WRITER_ADD` 标志 / 外部锁）
+- **延迟回收**：LF 模式下 `rte_hash_del_key` 不会立即释放 slot。要么用 `rte_hash_rcu_qsbr_add` 挂上 QSBR，由 rte_hash 在宽限期后自动回收（本项目邻居表的做法），要么自己等宽限期结束后调用 `rte_hash_free_key_with_position`。两者都不做，slot 永远不会被释放
 
 ### 2.3 SIMD 加速
 
@@ -130,6 +139,8 @@ int mask = _mm_movemask_epi8(cmp_result);                    // 得到匹配位�
 ---
 
 ## 三、改造详情
+
+> 以下第三节、第四节为重构前的历史代码，当前源码中已不存在（`FiveTuple` 的 packed 定义除外，仍在 `include/common/types.h`）。
 
 ### 3.1 涉及文件
 
@@ -305,8 +316,8 @@ SessionManager::instance().cleanup()        // 6. ★ 新增：释放 rte_hash
 
 | 维度 | 改造前 | 改造后 | 提升原因 |
 |------|--------|--------|----------|
-| **内存分配** | 每包 `malloc/free` | 零分配 | 预分配数组 |
-| **锁开销** | `spinlock` 互斥 | 读路径完全无锁 | RCU + CAS |
+| **内存分配** | 每个新连接 `malloc`（`unordered_map` 插入节点） | 零分配 | 预分配数组 |
+| **锁开销** | `spinlock` 互斥 | 读路径完全无锁 | LF 读 + RCU 回收 |
 | **Cache Miss** | 链式指针追逐 | 连续数组 + SIMD | 数据紧凑 |
 | **查找复杂度** | O(1) 平均，O(n) 最坏 | O(1) 确定性 | Cuckoo Hash |
 | **多核扩展性** | 随核数增加锁竞争加剧 | 读路径线性扩展 | 无锁读 |
@@ -447,4 +458,8 @@ while (1) {
 
 > **经验总结**：如果不确定，用 **Level-Triggered（默认模式）** 更安全。
 > EPOLLET 性能更好但容错率为零，任何遗漏都会导致连接僵死。
+>
+> **最终实现**：`RS_Src/epoll_server/simple_server_mt.c` 最后改成了 LT 模式 + 单次 `recv`（没读完的数据 epoll 会再次通知），
+> 并按 `\r\n\r\n` 统计一次读到的管线化请求数，逐个回复，避免 wrk keep-alive 管线化时请求和响应错位。
+> 压测现在用 nginx 作为后端（`docs/压测方案.md`），这个测试服务器只用于功能验证。
 

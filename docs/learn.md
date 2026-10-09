@@ -1,31 +1,35 @@
 # L4 负载均衡器学习教程
 
+> 本文第一部分按当前代码整理（2026-10-09）；第二部分"我的梳理过程"是学习过程中的笔记，个别地方加了更正。
+> 更详细的设计见 `docs/架构图.md`、`docs/pipeline改造.md`，运行和命令见根目录 README 与 `docs/控制命令.md`。
+
 ## 项目概述
 
-这是一个基于纯 DPDK 的高性能四层负载均衡器项目，对标腾讯 TGW (Tencent Gateway) / LVS DPDK 版。该项目实现了真正的 L4 负载均衡，不依赖 F-Stack 协议栈，避免 TCP 栈干扰导致的 RST 问题。
+这是一个基于纯 DPDK 的四层负载均衡器，参考 DPVS、LVS 和腾讯 TGW 的思路实现。数据包在用户态按包改写转发，不终止 TCP 连接，不依赖内核协议栈或 F-Stack。
 
 ### 核心特性
 
-- **真正的 L4** - 数据包级别转发，不终止 TCP 连接
-- **RSS 多核** - 自动多队列多核处理，线性性能扩展
-- **NAT/DR 双模式** - Full NAT 跨网段 + DR 同网段高性能
-- **Batch TX** - 批量发送优化，减少 PCIe 开销
-- **一致性哈希** - 基于五元组的智能流量分发，虚拟节点保证均匀分布
-- **零拷贝** - 直接操作 mbuf，无内存拷贝
-- **完整校验和** - IP 和 TCP/UDP 校验和全量重算，确保正确性
-- **ARP/ICMP** - 响应 Ping 请求，完整的 ARP 协议支持
-- **会话保持** - 双向会话表支持返回流量
+- **真正的 L4**：数据包级别转发，不终止 TCP 连接
+- **两种转发模式**：FULLNAT（跨网段，双向都经过 LB）和 DR（同二层，回包不经过 LB）
+- **两种数据面模式**：pipeline（1 个收包核 + N 个转发核，适合不支持 RSS 的网卡）和 rtc（每核独立收发，网卡 RSS 分流）
+- **无锁多核**：会话表每个转发核一份；配置以 RCU 快照发布；热路径无锁、无 malloc
+- **调度**：平滑加权轮询（WRR）、Maglev 一致性哈希
+- **FULLNAT 细节**：多 LIP 的 SNAT 端口池、TCP 状态机、TOA 透传客户端地址、去 SYN timestamp、ICMP 差错转换
+- **校验和**：网卡支持时用 TX offload，否则 L4 增量更新（TCP 选项变化时全量重算）
+- **运维**：ARP 解析与老化、免费 ARP、TCP 健康检查、unix socket 控制命令（动态增删后端）
+- **可观测性**：异步日志、按核忙碌率、按 RS 的包/字节计数、压测区间 PPS
 
 ### 性能表现
 
-测试环境：VMware Workstation, 4 vCPU, vmxnet3 网卡, wrk 压测工具
+VMware Workstation，vmxnet3，pipeline 1 个收包核 + 2 个转发核，后端 1 台 nginx，`wrk -t4 -c1000 -d60s`：
 
-| 测试场景 | QPS | 延迟 | 提升 |
+| 场景 | QPS | LB 转发 PPS | 转发核负载 |
 |---------|-----|------|------|
-| NAT 单队列 (优化前) | 15,996 | 67ms | 基准 |
-| **NAT 4队列 + Batch TX** | **22,466** | 45ms | **+40%** |
-| **DR 4队列 + Batch TX** | **31,976** | 33ms | **+100%** 🔥 |
-| 直连后端 (无 LB) | 50,109 | 35ms | 参考值 |
+| 直连 nginx | 161,674 | – | – |
+| FULLNAT | 126,145（78%） | 22.4 万（双向） | 67% |
+| DR | 133,090（82%） | 12.1 万（只有入向） | 33% |
+
+瓶颈在虚拟交换机和后端，LB 自身还有余量。说明和复现方法见 README 第六节、`docs/压测方案.md`。
 
 ## 架构介绍
 
@@ -33,305 +37,243 @@
 
 ```
 l4-loadbalancer/
-├── CMakeLists.txt              # CMake 构建配置
-├── config/
-│   └── lb.conf                 # 负载均衡器配置文件
-├── include/                    # 头文件
-│   ├── common/                 # 公共类型和工具
-│   │   ├── types.h             # 核心数据结构
-│   │   ├── config.h            # 配置管理
-│   │   └── logger.h            # 日志系统
-│   ├── protocol/               # 协议处理
-│   │   ├── ethernet.h          # 以太网帧
-│   │   ├── arp.h               # ARP 协议
-│   │   ├── icmp.h              # ICMP 协议
-│   │   └── ip.h                # IP/TCP/UDP
-│   ├── lb/                     # 负载均衡核心
-│   │   ├── consistent_hash.h   # 一致性哈希
-│   │   ├── real_server.h      # RS 管理
-│   │   └── session.h           # 会话管理 (支持双向追踪)
-│   ├── forward/                # 转发引擎
-│   │   ├── forwarder.h         # 接口定义
-│   │   ├── nat_forwarder.h     # NAT 模式 (Full NAT)
-│   │   └── dr_forwarder.h      # DR 模式
-│   └── core/                   # 核心模块
-│       ├── ring_buffer.h       # 无锁队列
-│       └── loadbalancer.h      # LB 核心类
-├── src/
-│   └── main.cpp                # 程序入口 (纯 DPDK)
-├── tests/                      # 单元测试
-├── scripts/                    # 脚本
-└── docs/                       # 文档
+├── CMakeLists.txt / build.sh   # 构建（./build.sh 一键编译）
+├── config/                     # lb.conf（FULLNAT）、lb_dr.conf（DR）、bench*.conf（压测）
+├── include/ src/               # 一一对应
+│   ├── common/                 # 配置、日志（异步）、统计计数器、公共类型
+│   ├── protocol/               # 以太网/IP/TCP/UDP 头、解析器、校验和、ARP/ICMP
+│   ├── lb/                     # 会话表、TCP 状态机、调度器（WRR / Maglev）
+│   ├── forward/                # FULLNAT / DR 改写、TOA、ICMP 差错转换
+│   ├── net/                    # 邻居表（ARP）、路由
+│   ├── ctrl/                   # 配置快照（RCU）、健康检查、控制命令
+│   ├── dataplane/              # 端口、分发（steering）、receiver / worker / master 线程
+│   └── core/                   # 报文分类与处理主流程（processor）
+├── src/main.cpp                # 启动、装配、退出
+├── scripts/                    # setup_dpdk_env.sh（网卡接管）、l4lbctl.py（控制命令）
+├── tests/unit/                 # 单元测试（ctest）
+├── tests/functional/           # 功能测试（veth + net_af_packet，不需要真实网卡）
+├── tests/perf/                 # 压测脚本
+└── docs/                       # 设计文档、学习笔记
 ```
 
 ### 核心架构
 
-项目采用分层架构设计：
+```
+                       pipeline 模式（VMware vmxnet3 下使用）
+网卡 ──> receiver（收包核）──rx_ring──> worker 0：查会话 → 调度 → 改写 → 发包
+         按五元组 / SNAT 端口   └──rx_ring──> worker 1：同上
+         算出会话所在的核
+master 线程（普通线程）：ARP、邻居老化、免费 ARP、健康检查、周期统计
+控制线程：unix socket 命令 → 构建新配置快照 → RCU 发布
+```
 
-1. **数据包处理层** - DPDK 负责收发数据包
-2. **协议解析层** - 解析以太网、IP、TCP/UDP 头部
-3. **负载均衡层** - 一致性哈希选择后端，NAT/DR 转发
-4. **会话管理层** - 双向会话追踪，支持连接保持
+1. **收发包**：DPDK 轮询网卡，`rte_eth_rx_burst` / `rte_eth_tx_burst` 批量收发
+2. **分发**：保证同一条连接的双向包都由同一个转发核处理（会话表不跨核共享）
+3. **协议解析**：以太网、IPv4、TCP/UDP，提取五元组
+4. **负载均衡**：新连接按 WRR 或 Maglev 选 RS，建会话
+5. **转发**：FULLNAT 改 IP/端口/MAC 和校验和；DR 只改 MAC
 
-### NAT vs DR 模式
+### FULLNAT vs DR 模式
 
-#### NAT 模式 (Full NAT)
-- LB 修改源 IP 和目的 IP
-- 返回流量必须经过 LB（因为 RS 看到的客户端是 LB）
-- 适用于跨网段部署
-- 性能较低（需要处理双向流量）
+#### FULLNAT
+- LB 同时修改源地址（改成 LIP:SNAT 端口）和目的地址（改成 RS）
+- RS 看到的客户端是 LB，回包必须经过 LB；需要 TOA 才能拿到真实客户端 IP
+- 可以跨网段部署，RS 端口可以与 VIP 端口不同
+- LB 要处理双向流量
 
 #### DR 模式 (Direct Routing)
-- LB 只修改二层 MAC 地址，IP 层完全不动
+- LB 只修改二层 MAC 地址，IP 和端口完全不动
 - 返回流量直接从 RS 到 Client，不经过 LB
-- 性能极高（LB 只处理入站流量）
-- 仅适用于同网段部署
+- LB 只处理入向，同样流量下负载约为 FULLNAT 的一半
+- 要求 LB 和 RS 在同一二层网络，RS 的 lo 上要配 VIP 并关闭 VIP 的 ARP 响应，RS 端口必须与 VIP 端口相同
 
 ## 环境搭建
 
 ### 系统要求
 
-- Ubuntu 18.04/20.04/22.04
-- DPDK 23.11.x (系统安装或 `/data/f-stack/dpdk`)
-- GCC 7+ 或 Clang 6+
-- CMake 3.16+
-- libnuma-dev
+- Linux x86_64（当前在 Anolis OS 8 / 内核 5.10 上开发）
+- DPDK 24.11（本机安装在 `/root/dpvs/dpvs/dpdk-24.11/dpdklib`）
+- GCC 8+（C++17）、CMake 3.16+、pkg-config
+- 大页内存；DPDK 能用的网卡（vfio-pci / uio_pci_generic），或者只跑功能测试时用 veth
 
 ### DPDK 安装
 
 ```bash
-# 下载 DPDK
-wget https://fast.dpdk.org/rel/dpdk-23.11.tar.xz
-tar xf dpdk-23.11.tar.xz
-cd dpdk-23.11
-
-# 编译安装
-meson build
-cd build
-ninja
-sudo ninja install
-sudo ldconfig
+wget https://fast.dpdk.org/rel/dpdk-24.11.tar.xz
+tar xf dpdk-24.11.tar.xz && cd dpdk-24.11
+meson setup build --prefix=/opt/dpdk
+ninja -C build && sudo ninja -C build install && sudo ldconfig
 ```
 
 ### 项目编译
 
 ```bash
-cd l4-loadbalancer
-
-# 设置 DPDK 环境变量（如果不在默认路径）
-export DPDK_PATH=/data/f-stack/dpdk
-export PKG_CONFIG_PATH=$DPDK_PATH/lib/x86_64-linux-gnu/pkgconfig:$PKG_CONFIG_PATH
-export LD_LIBRARY_PATH=$DPDK_PATH/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
-
-# 编译
-mkdir -p build && cd build
-cmake .. -DDPDK_PATH=$DPDK_PATH
-make -j$(nproc)
+./build.sh                          # 自动查找 libdpdk.pc，产物 build/l4lb
+./build.sh test                     # 编译 + 单元测试
+DPDK_PREFIX=/opt/dpdk ./build.sh    # DPDK 不在默认位置时
 ```
 
 ## 代码结构讲解
 
 ### 入口文件：main.cpp
 
-主程序负责 DPDK 初始化、多核工作线程启动和统计信息收集。
+只负责启动流程：参数解析 → 加载并校验配置 → 打开日志文件 → EAL 初始化 → 规划并初始化网卡队列 → 创建 RCU、邻居表、配置快照、各 worker 的会话表和 ring → 启动控制线程、master 线程 → 在各 lcore 上启动 worker（pipeline 下 main lcore 跑 receiver）→ 收到信号后退出并打印统计。
 
-关键组件：
-- **DPDK 初始化** - EAL 初始化、端口配置、RSS 多队列设置
-- **Worker 循环** - 每个核心运行独立的工作线程
-- **批量发送优化** - TX Buffer 管理，减少 PCIe 开销
-- **统计收集** - Per-core 统计，避免 False Sharing
+### 数据面线程：dataplane/
 
-### 核心类：LoadBalancer
+- `receiver.cpp`：pipeline 的收包核。`Dispatcher::target()` 按规则算出目标 worker（入站 `fwd_owner`、FULLNAT 回程 `ret_owner`、ICMP/分片按地址哈希、ARP 给 worker 0）
+- `worker.cpp`：`worker_loop()`，每轮取包 → `process_packet()` → 批量发包 → 报告 RCU 静默期，每 1024 轮推进会话时间轮；也包含统计输出（`stats` / `counters` / `rate`）
+- `master.cpp`：master 线程，每 1ms 处理 worker 上报的事件（ARP 学习、邻居缺失、健康检查回包），跑周期任务，从独占的 TX 队列发 ARP 和健康检查报文
+- `steering.cpp`：会话 owner 的计算。软件模式：入站 `jhash % N`，回程 `nat_port % N`；硬件 RSS 模式：软件复现网卡的 Toeplitz 哈希
+- `port.cpp`：队列规划（TX = worker 数 + 1，RX 取 2 的幂）、RSS/RETA、offload
 
-[loadbalancer.h](include/core/loadbalancer.h) 是整个系统的核心，负责数据包处理流程。
+### 报文处理：core/processor.cpp
 
-主要方法：
-- `process_packet()` - 数据包处理入口
-- `handle_ipv4()` - IPv4 数据包处理
-- `handle_inbound()` - 入站流量处理 (DNAT)
-- `handle_return()` - 返回流量处理 (SNAT)
+`process_packet()` 是处理入口，按以太类型、协议、目的地址分到：
+- `handle_arp()`：应答本机地址的 ARP，学习邻居（交给 master）
+- `handle_icmp()`：echo 应答、ICMP 差错转换
+- `handle_inbound()`：客户端 → VIP，查会话或新建会话，改写后发给 RS
+- `handle_return()`：FULLNAT 回程，RS → LIP，改写后发回客户端
+- `handle_hc_response()`：健康检查回包，交给 master
 
-### 协议处理
+### 负载均衡与会话：lb/
 
-项目实现了完整的协议栈处理：
+- `scheduler.cpp`：平滑加权轮询（WRR，展开成表，O(1)）和 Maglev 一致性哈希（65537 个槽位的查找表，按五元组 jhash 取槽，O(1)；增删后端时只有少量连接被重新映射）。调度表在控制面构建，数据面只读
+- `session.cpp`：每个 worker 一张会话表，rte_hash 做索引 + 预分配的会话数组 + 1 秒粒度的时间轮。FULLNAT 会话有正向（Client → VIP）和回程（RS → LIP）两个 key，指向同一个会话。只由所属 worker 访问，不需要锁
+- `tcp_state.cpp`：SYN_RECV / ESTABLISHED / FIN_WAIT / TIME_WAIT / CLOSE，各状态独立超时
 
-- **Ethernet** - MAC 地址解析和交换
-- **ARP** - ARP 请求/响应处理，支持 ARP 探测
-- **IP** - IP 头部解析，校验和计算
-- **TCP/UDP** - 端口解析，五元组提取
-- **ICMP** - Ping 响应处理
+### 转发：forward/nat_forwarder.cpp
 
-### 负载均衡算法
+- `nat_rewrite()`：FULLNAT 改写源/目的 IP、端口、MAC、TTL，更新校验和，按需插入 TOA、去掉 SYN 的 timestamp
+- `dr_rewrite()`：只改 MAC
+- `nat_rewrite_icmp_error()`：ICMP 差错报文的内外层地址转换
 
-#### 一致性哈希
+校验和策略见 `docs/校验处理.md` 第 5 节。
 
-[consistent_hash.h](include/lb/consistent_hash.h) 实现了基于 MurmurHash3 的一致性哈希算法。
+### 控制面：ctrl/
 
-特点：
-- 使用虚拟节点提高负载均衡性
-- 节点增减时只影响相邻节点的流量
-- 基于五元组哈希保持会话亲和性
-
-#### 会话管理
-
-[session.h](include/lb/session.h) 实现了双向会话追踪。
-
-功能：
-- 正向会话：Client -> VIP 映射到 RS
-- 反向会话：RS -> Client 映射回原始 Client
-- 会话超时清理
-- 线程安全设计
-
-### 转发引擎
-
-项目支持两种转发模式：
-
-#### NAT Forwarder
-
-[nat_forwarder.h](include/forward/nat_forwarder.h)
-- DNAT：修改目的 IP 为 RS IP
-- SNAT：修改源 IP 为 VIP
-- 校验和重算
-
-#### DR Forwarder
-
-[dr_forwarder.h](include/forward/dr_forwarder.h)
-- 只修改目的 MAC 地址
-- IP 层完全不动
-- 性能最高
+- `snapshot.cpp`：期望状态（服务、RS、权重、健康状态）→ 构建只读快照 → 原子替换 → RCU 宽限期后释放旧快照
+- `healthcheck.cpp`：在 master 线程里从 `hc_src` 发 TCP SYN 探测 RS，连续失败摘除、连续成功加回
+- `control.cpp`：unix socket 命令（`services`、`add`、`del`、`weight`、`enable`、`disable`、`stats`、`rate`、`counters`、`log`、`quit`）
 
 ## 构建和运行
 
 ### 配置文件
 
-修改 `config/lb.conf`：
+`config/lb.conf`（节选，完整说明见文件内注释）：
 
 ```ini
 [global]
-mode = nat                      # 转发模式: nat 或 dr
-log_level = info
-session_timeout = 300           # 会话超时 (秒)
+mode = nat                 # nat（FULLNAT）或 dr
+dataplane = pipeline       # pipeline 或 rtc
+log_dir = /data/logs/l4
+max_sessions = 1048576
+tcp_established_timeout = 900
 
-[vip]
-ip = 192.168.72.160             # VIP 地址
-ports = 80,8080                 # 监听端口
-mac = 00:0C:29:3E:38:92         # 本机 MAC
+[network]
+netmask = 255.255.255.0
+gateway = 192.168.154.2
+local_ips = 192.168.154.131, 192.168.154.134, 192.168.154.135, 192.168.154.136
 
-[realserver]
-count = 2
-server1 = 192.168.72.145:8080:100:00:0c:29:e2:b7:c6
-server2 = 192.168.72.149:8080:100:00:0c:29:bd:b3:a4
+[healthcheck]
+enabled = true
+
+[control]
+socket = /run/l4lb.sock
+
+[service.http]
+vip = 192.168.154.130
+port = 80
+proto = tcp
+scheduler = wrr            # wrr 或 maglev
+server1 = 192.168.154.140:80:1        # ip:port[:weight[:mac]]，mac 留空则走 ARP
+server2 = 192.168.154.140:8080:1
 ```
+
+旧格式（`[vip]` + `[realserver]`，`session_timeout`）仍然兼容。
 
 ### 运行命令
 
 ```bash
-# 绑定 DPDK 大页和网卡（首次运行需要）
-sudo echo 1024 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
-sudo $DPDK_PATH/usertools/dpdk-devbind.py --bind=vfio-pci <网卡PCI地址>
+# 大页 + 驱动 + 网卡接管（每次重启后执行）
+sudo DPDK_NIC=ens160 scripts/setup_dpdk_env.sh up
 
-# 单核运行 (开发/调试)
-sudo ./l4lb -l 0 -n 4 -- --lb-config ../config/lb.conf --log info
+# 先检查配置
+./build/l4lb -- --lb-config config/lb.conf --check-config
 
-# 多核运行 (推荐，启用 RSS 多队列提升性能)
-# 使用 4 个核心 (lcore 0-3)，自动创建 4 个 RX/TX 队列
-sudo ./l4lb -l 0-3 -n 4 -- --lb-config ../config/lb.conf
+# pipeline：lcore 1 收包分发，lcore 2、3 两个转发核
+sudo ./build/l4lb -l 1-3 -- --lb-config config/lb.conf
 
-# 使用 8 个核心
-sudo ./l4lb -l 0-7 -n 4 -- --lb-config ../config/lb.conf
+# 运行时查看和调整
+scripts/l4lbctl.py services
+scripts/l4lbctl.py stats -v
+tail -f /data/logs/l4/l4lb.log
 ```
 
-### RSS 多队列说明
+### 多核与队列
 
-项目支持 RSS (Receive Side Scaling) 多队列，自动根据启动时指定的 lcore 数量创建对应的 RX/TX 队列：
-
-```
--l 0      → 1 个核心，1 个队列 (无 RSS)
--l 0-3    → 4 个核心，4 个队列 (RSS 启用)
--l 0-7    → 8 个核心，8 个队列 (RSS 启用)
-```
+- pipeline：`-l` 里第一个 lcore 是 receiver，其余是 worker；至少 2 个 lcore
+- rtc：每个 lcore 都是 worker
+- 两种模式下网卡 TX 队列数都要不少于 worker 数 + 1（最后一个给 master 线程）
+- VMware Workstation 的 vmxnet3 不做 RSS（所有包进同一个队列），所以用 pipeline；在支持 RSS 的网卡上可以用 rtc
 
 ## 测试
 
 ### 单元测试
 
-项目包含完整的单元测试：
+```bash
+./build.sh test        # 或者 cd build && ctest
+```
+
+8 个测试程序：配置解析、日志、receiver 分发规则、报文改写与校验和、调度器、会话表与时间轮、steering（Toeplitz 标准向量）、TCP 状态机。
+
+### 功能测试
 
 ```bash
-# 构建测试
-mkdir -p build && cd build
-cmake .. -DBUILD_TESTS=ON
-make -j$(nproc)
-
-# 运行测试
-./tests/unit/test_consistent_hash
-./tests/unit/test_ring_buffer
-./tests/unit/test_protocol
+sudo python3 tests/functional/run_tests.py build/l4lb
+sudo L4T_DATAPLANE=pipeline python3 tests/functional/run_tests.py build/l4lb   # pipeline 模式跑一遍
 ```
+
+在 veth 上用 `net_af_packet` 启动 l4lb，用 raw socket 收发构造的报文，覆盖 FULLNAT/DR 转发、畸形包、会话回收、TCP 状态机、多 LIP、TOA、ICMP 差错、ARP/网关、健康检查、控制命令、多核、pipeline 分发、包/字节计数、日志文件。
 
 ### 性能测试
 
-#### 基础功能测试
+客户端、LB、RS 分别放在不同的 VM 上，步骤见 `docs/压测方案.md`：
 
 ```bash
-# 安装 wrk
-sudo apt update && sudo apt install wrk
-
-# 测试 10秒, 100并发
-wrk -t4 -c100 -d10s http://192.168.72.160
-```
-
-#### 压力测试
-
-```bash
-# 测试 30秒, 1000并发
-wrk -t12 -c1000 -d30s http://192.168.72.160
+wrk -t4 -c1000 -d60s --latency http://192.168.154.130/     # 在 client 上
+scripts/l4lbctl.py counters > /tmp/before.txt              # 在 LB 上，压测前
+scripts/l4lbctl.py delta /tmp/before.txt                   # 在 LB 上，压测后：PPS、忙碌率
 ```
 
 ### 抓包调试
 
+DPDK 接管的网卡（ens160）在内核里看不到，`tcpdump -i ens160` 抓不到包。可以在 client 或 RS 上抓：
+
 ```shell
-sudo tcpdump -i ens160 -n -e -v tcp port 80
+sudo tcpdump -i ens33 -n -e -v tcp port 80
 ```
 
 ## 常见问题排查
 
-### 问题 1: ERR_CONNECTION_RESET
+### 问题 1：连接被 RST 或不通
 
-**原因**: 流量方向判断错误或校验和问题
+**排查**：
+- `scripts/l4lbctl.py stats` 看 `Drops:` 一行的丢包原因（对照表见 `docs/控制命令.md` 第四节）
+- 在 RS 上 `tcpdump -v`，看收到的包是否 `cksum correct`
+- 校验和问题可以用 `cmake -DL4LB_HW_CKSUM=OFF` 编译，改为软件计算，排除 offload 的影响
 
-**排查**:
+### 问题 2：日志出现 `No available backend`
+
+所有后端都是 `down`、`disabled` 或权重为 0。用 `scripts/l4lbctl.py services` 查看，健康检查失败时检查 RS 端口和防火墙；也可以用 `add` / `del` 命令在运行时换后端（`docs/控制命令.md` 第三节）。
+
+### 问题 3：DR 模式下 RS 收不到包或客户端绕过了 LB
+
+RS 没有配置 VIP，或者 RS 应答了 VIP 的 ARP：
+
 ```bash
-# 检查校验和
-sudo tcpdump -i ens33 port 8080 -n -v
-# 应该看到 "cksum correct"
-```
-
-**解决方案**:
-- 检查流量方向判断逻辑
-- 确保校验和计算正确
-- 禁用硬件 offload: `mbuf->ol_flags = 0`
-
-### 问题 2: Session 查找失败
-
-**原因**: 会话表中没有匹配的条目
-
-**排查**:
-```bash
-# 启用 DEBUG 日志
-sudo ./l4lb ... --log debug
-```
-
-### 问题 3: DR 模式下 RS 无法收到包
-
-**原因**: RS 没有配置 VIP
-
-**解决方案**:
-```bash
-# 在 RS 上配置 VIP 到 loopback
-sudo ip addr add 192.168.72.160/32 dev lo
-sudo sysctl -w net.ipv4.conf.all.arp_ignore=1
-sudo sysctl -w net.ipv4.conf.all.arp_announce=2
+sudo tests/perf/dr_rs.sh up      # 在 RS 上：先改 arp_ignore/arp_announce，再在 lo 上加 VIP
+ip neigh flush 192.168.154.130   # 在 client 上清掉 VIP 的旧 ARP 缓存
 ```
 
 ## 后端开发面试准备
@@ -347,73 +289,79 @@ sudo sysctl -w net.ipv4.conf.all.arp_announce=2
 | 性能 | 较低 | 高（零拷贝） |
 | 实现方式 | accept() + connect() | 直接修改数据包头部 |
 
-#### 2. NAT vs DR 模式
+#### 2. FULLNAT vs DR 模式
 
-**面试题**: DR 模式为什么性能高？
+**面试题**：DR 模式为什么性能高？
 
-**答案**: LB 只处理入站流量，出站流量直接从 RS 返回客户端，LB 压力减少一半以上。
+**答案**：LB 只处理入站流量，响应（通常更大）由 RS 直接返回客户端。本项目实测：同样流量下 DR 的转发核负载约为 FULLNAT 的一半。
 
-**面试题**: DR 模式的限制是什么？
+**面试题**：DR 模式的限制是什么？
 
-**答案**: 要求 LB 和 RS 在同一二层网络（可通过二层 MAC 直达）。
+**答案**：LB 和 RS 要在同一二层网络；RS 要在 lo 上配置 VIP 并关闭 VIP 的 ARP 响应；不能改端口，RS 端口必须等于 VIP 端口。
 
-#### 3. 一致性哈希
+**面试题**：FULLNAT 下回程包怎么回到创建会话的那个核？
 
-**面试题**: 什么是虚拟节点？为什么需要？
+**答案**：回程包的目的端口就是 LB 分配的 SNAT 端口。分配端口时只挑"回程会被分到本核"的端口（软件分发：`port % N == 本核`；硬件 RSS：软件算 Toeplitz 哈希，挑落到本核队列的端口），收到回程包时按同样的规则就能算出会话在哪个核。
 
-**答案**: 虚拟节点是将一个物理节点映射为多个虚拟节点，分散在哈希环上，提高负载均衡的均匀性。
+#### 3. 一致性哈希（Maglev）
 
-**面试题**: 一致性哈希的优势？
+**面试题**：Maglev 和哈希环有什么区别？
 
-**答案**: 节点增减时只影响相邻节点的流量，不需要重新哈希所有键值对。
+**答案**：哈希环靠虚拟节点保证均匀，查找要二分；Maglev 预先构建一张大小为素数 M（本项目 65537）的查找表，每个后端按自己的 offset/skip 序列轮流填槽，查找时 `table[hash % M]`，O(1)，负载更均匀，增删后端时被重新映射的连接也很少。
+
+**面试题**：一致性哈希的优势？
+
+**答案**：后端增减时只有少量连接改变去向，大部分连接不受影响。
 
 #### 4. DPDK 性能优化
 
-**面试题**: DPDK 为什么快？
+**面试题**：DPDK 为什么快？
 
-**答案**:
-- 用户态驱动，避免系统调用
+**答案**：
+- 用户态驱动 + 轮询，避免中断和系统调用
 - 大页内存，减少 TLB miss
-- CPU 亲和性绑定，减少缓存失效
-- 批量处理，减少中断次数
+- 线程绑核，减少缓存失效和调度
+- 批量收发（burst），摊薄每包的固定开销
+- 每核私有数据（会话表、计数器、mbuf 本地缓存），避免锁和伪共享
 
-#### 5. 零拷贝技术
+#### 5. 零拷贝
 
-**面试题**: 什么是零拷贝？项目中如何实现？
+**面试题**：什么是零拷贝？项目中如何实现？
 
-**答案**: 零拷贝是指数据在内存中不发生拷贝，直接在内核缓冲区和用户缓冲区之间传递。项目中使用 DPDK mbuf，直接操作数据包缓冲区。
+**答案**：数据在收发过程中不在内存里来回拷贝。DPDK 的网卡直接 DMA 到大页上的 mbuf，程序在原 mbuf 上改写包头后直接发出，整个过程没有内核态和用户态之间的拷贝。
+
+#### 6. 无锁与 RCU
+
+**面试题**：运行时修改后端，转发核怎么保证读到一致的配置又不加锁？
+
+**答案**：控制线程把新配置构建成一个只读快照，原子地替换指针；转发核每处理完一批包报告一次"静默期"（不再引用旧快照）；控制线程等所有读者都报告过之后再释放旧快照（DPDK 的 `rte_rcu_qsbr`）。读的一侧只有一次原子 load。
 
 ### 常见面试题
 
 1. **如何保证会话亲和性？**
-   - 使用五元组 (源IP、目的IP、源端口、目的端口、协议) 作为哈希键
-   - 一致性哈希确保相同连接总是路由到同一后端
+   - 新连接按调度算法选 RS 后建立会话，之后同一连接的包都查会话表，不再调度
+   - Maglev 一致性哈希在会话表丢失时（例如换了 LB 实例）也能让大部分连接落到原来的 RS
 
 2. **如何处理连接超时？**
-   - 会话表记录最后活动时间
-   - 定时清理过期会话
-   - 使用高效的数据结构支持快速查找
+   - TCP 各状态独立超时（SYN 10 秒、ESTABLISHED 900 秒、TIME_WAIT 10 秒等）
+   - 1 秒粒度的时间轮：每包只更新过期时间，不移动链表；时间轮扫到时再判断是否真的过期
 
 3. **如何实现高可用？**
-   - 多 LB 实例共享 VIP (使用 VRRP 或类似协议)
-   - 健康检查机制
-   - 故障检测和自动切换
+   - 多 LB 实例共享 VIP（VRRP 主备，或 BGP ECMP 多活）
+   - 健康检查自动摘除故障后端（本项目已实现）
+   - 会话同步（本项目未实现）
 
-4. **性能瓶颈在哪里？如何优化？**
-   - 网络 I/O: 使用多队列 RSS
-   - CPU: 多核并行处理
-   - 内存: 零拷贝设计
-   - 锁竞争: 分片锁或无锁数据结构
+4. **性能瓶颈在哪里？如何定位？**
+   - 看每个线程的忙碌率（只算处理包的 TSC 周期，不能看 top）、网卡 `imissed`、ring 是否满
+   - 本项目在 VMware 下转发核负载 67% 时 QPS 已经到顶，网卡也没丢包，说明瓶颈在虚拟交换机和后端，不在 LB
 
 ### 学习建议
 
-1. **深入理解 DPDK**: 阅读 DPDK 官方文档，理解 mbuf、端口、队列等概念
-2. **网络协议栈**: 掌握 TCP/IP 协议栈，理解数据包格式和校验和计算
-3. **并发编程**: 学习无锁编程、原子操作、多核编程
-4. **性能分析**: 使用 perf、火焰图等工具分析性能瓶颈
-5. **实践项目**: 尝试修改代码，添加新功能，如新的负载均衡算法
-
-通过学习这个项目，你将掌握高性能网络编程的核心技能，为后端开发面试打下坚实基础。记住，理论知识和实践经验同样重要！
+1. **深入理解 DPDK**：mbuf、mempool、ethdev 队列、rte_ring、rte_hash、rte_rcu_qsbr
+2. **网络协议栈**：TCP/IP 头部格式、TCP 状态机、校验和与伪头部
+3. **并发编程**：无锁数据结构、内存序（acquire/release、relaxed）、RCU、伪共享
+4. **性能分析**：perf、火焰图，以及忙碌率、PPS 这类数据面指标
+5. **实践**：尝试修改代码，例如加一个调度算法、实现 SYN proxy，或者在支持 RSS 的环境里对比 rtc 和 pipeline
 
 
 
@@ -421,7 +369,7 @@ sudo sysctl -w net.ipv4.conf.all.arp_announce=2
 
 ## **1.FULLNAT数据的修改和流向**
 
-![image-20260209205025874](C:\Users\27708\AppData\Roaming\Typora\typora-user-images\image-20260209205025874.png)
+（原图是本机 Typora 的本地图片，没有放进仓库。FULLNAT 的四步改写见 `docs/架构图.md` 第五节。）
 
 ## **2.项目的应用场景**
 
@@ -461,7 +409,8 @@ sudo sysctl -w net.ipv4.conf.all.arp_announce=2
 
 - **原理**：
 
-    在 TCP 三次握手的 **SYN 包** 中，利用 TCP Header 里的 `Options` 字段。
+    利用 TCP Header 里的 `Options` 字段。
+    （本项目的实现：不放在 SYN 里，而是在握手完成前客户端方向的非 SYN 包里（通常是第三个 ACK）插入，选项号 254，与 DPVS 的 toa.ko 一致；配置 `toa = on` 开启。）
 
     你自定义一个 `Option ID`（通常是 `254` 或 `200`），然后把 `Client IP` 和 `Client Port` 塞进去。
 
@@ -543,6 +492,8 @@ sudo sysctl -w net.ipv4.conf.all.arp_announce=2
 
 1. **先做 Proxy Protocol**：这能让你快速跑通整个流程（L4 -> Nginx -> 真实 IP 显示）。这在 DPDK 里就是构建一个 `rte_mbuf`，填上字符串，链在真实数据包前面发出去。
 2. **进阶挑战 TOA**：如果你想挑战腾讯 TGW 的底层黑科技，再去尝试修改 TCP Options。这需要你对 `rte_tcp_hdr` 结构体和 TCP 校验和算法（Checksum Offload）有非常深的理解。
+
+> **最终的选择**：本项目实现的是 TOA（`src/forward/nat_forwarder.cpp` 的 `insert_toa()`），没有实现 Proxy Protocol。原因是 Proxy Protocol 要求 LB 往 TCP 流里插入数据，之后整条连接的序列号都要做偏移，LB 就不再是纯粹的按包改写，复杂度高得多。TOA 只改一个包的 TCP 选项，序列号不变。
 
 所以，如果你的目标是“应用到实际场景”，**Proxy Protocol 是目前最通用的答案**。如果您想试试怎么写，我可以给你展示一段 Proxy Protocol 的报文示例。
 
@@ -688,15 +639,11 @@ sudo sysctl -w net.ipv4.conf.all.arp_announce=2
 
 ## DR模式下数据流向
 
-
-
-
+见 `docs/架构图.md` 第五节和 `docs/压测方案.md` 第十节：LB 只把目的 MAC 改成 RS 的 MAC，RS 的 lo 上有 VIP 所以会接收，回包源地址是 VIP，直接发给客户端。
 
 ## DPDK的常用的数据结构
 
-
-
-
+本项目用到的：`rte_mbuf`（报文）、`rte_mempool`（mbuf 池）、`rte_ring`（线程间传递 mbuf 和事件）、`rte_hash`（会话表、邻居表）、`rte_rcu_qsbr`（快照和邻居表的无锁读）。
 
 ## DPDK常用的API函数
 
@@ -714,4 +661,6 @@ sudo sysctl -w net.ipv4.conf.all.arp_announce=2
       rte_pktmbuf_pool_create("MBUF_POOL", NUM_MBUFS, MBUF_CACHE_SIZE, 0,
                               RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
 ```
+
+（这是早期代码。现在 `src/main.cpp` 按队列描述符数、ring 大小和每核缓存计算 mbuf 数量，并分配在网卡所在的 NUMA 节点：`rte_pktmbuf_pool_create("MBUF_POOL", nb_mbufs, MBUF_CACHE_SIZE, 0, RTE_MBUF_DEFAULT_BUF_SIZE, g_dp.socket_id)`。）
 

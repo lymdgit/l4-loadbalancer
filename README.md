@@ -20,6 +20,7 @@
 
 ```text
 CMakeLists.txt
+build.sh           一键编译（./build.sh help）
 config/            lb.conf（FULLNAT）、lb_dr.conf（DR）、bench.conf / bench_dr.conf（压测）
 scripts/           setup_dpdk_env.sh（大页/驱动/网卡接管）、l4lbctl.py（控制命令）
 include/ src/      一一对应：
@@ -65,6 +66,16 @@ sudo DPDK_NIC=ens160 scripts/setup_dpdk_env.sh install
 - 脚本拒绝接管带 IP 地址、承载默认路由或当前 SSH 会话的网卡，避免管理口失联
 
 ### 3. 编译
+
+```bash
+./build.sh              # 编译，产物 build/l4lb
+./build.sh test         # 编译 + 单元测试
+./build.sh clean        # 清空 build/ 后重新编译
+./build.sh asan         # ASan + UBSan，输出到 build-asan/
+DPDK_PREFIX=<dpdk-install> ./build.sh   # DPDK 不在默认位置时
+```
+
+`build.sh` 会自动查找 `libdpdk.pc`（已有的 `PKG_CONFIG_PATH`、本机 DPDK 安装目录、`/usr/local`、`/opt/dpdk`），额外的 cmake 参数通过 `CMAKE_ARGS` 传入。手动编译：
 
 ```bash
 PKG_CONFIG_PATH=<dpdk-install>/lib64/pkgconfig cmake -S . -B build
