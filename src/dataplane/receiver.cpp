@@ -114,13 +114,12 @@ int receiver_loop(void *) {
   LOG_INFO("Receiver started on lcore %u, polling %u RX queue(s) for %u "
            "workers",
            rte_lcore_id(), g_dp.num_rx_queues, g_dp.num_workers);
+  BusyMeter busy;
   while (g_running.load(std::memory_order_relaxed)) {
-    const uint64_t t0 = rte_rdtsc();
     unsigned work = 0;
     for (uint16_t q = 0; q < g_dp.num_rx_queues; ++q)
       work += dispatch_rx_queue(d, q, stats);
-    if (work) // 忙碌率：只累计收到包的轮次
-      stats.add_busy(rte_rdtsc() - t0);
+    busy.loop(work != 0, stats);
   }
   LOG_INFO("Receiver on lcore %u exiting", rte_lcore_id());
   return 0;

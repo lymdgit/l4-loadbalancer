@@ -19,6 +19,7 @@
 #include <cstdint>
 
 #include <rte_common.h> // RTE_CACHE_LINE_SIZE
+#include <rte_cycles.h> // rte_rdtsc
 
 namespace l4lb {
 
@@ -117,6 +118,44 @@ struct alignas(RTE_CACHE_LINE_SIZE) WorkerStats {
   uint64_t get_bytes(ByteStat id) const { return stat_get(bytes[id]); }
   void add_busy(uint64_t cycles) { stat_add(busy_tsc, cycles); }
   uint64_t busy() const { return stat_get(busy_tsc); }
+};
+
+/**
+ * @brief 忙碌率采样：每个轮询线程一个（栈上），不跨线程
+ *
+ * 不在每轮循环里读 TSC：VMware 等虚拟化环境可能拦截 rdtsc（实测本机每次约 4 µs，
+ * 正常约 10 ns），每轮读两次会让读时钟本身占满 CPU。改为每 kWindow 轮读一次：
+ *   - 整个窗口都是空轮询时，用它校准"一次空轮询"的耗时（指数平均）
+ *   - 其他窗口：忙碌时间 = 窗口耗时 - 空轮询次数 × 空轮询耗时
+ * 还没校准过时（启动后一直满载）退化为按轮次比例估算。
+ */
+class BusyMeter {
+public:
+  static constexpr uint32_t kWindow = 256;
+
+  /// 每轮循环调用一次
+  inline void loop(bool had_work, WorkerStats &st) {
+    idle_ += !had_work;
+    if (++n_ < kWindow)
+      return;
+    uint64_t now = rte_rdtsc();
+    if (last_) {
+      uint64_t el = now - last_;
+      if (idle_ == n_) {
+        uint64_t c = el / n_;
+        idle_cost_ = idle_cost_ ? (idle_cost_ * 7 + c) / 8 : c;
+      } else {
+        uint64_t idle_t = idle_cost_ ? uint64_t(idle_) * idle_cost_ : el * idle_ / n_;
+        st.add_busy(idle_t < el ? el - idle_t : 0);
+      }
+    }
+    last_ = now;
+    n_ = idle_ = 0;
+  }
+
+private:
+  uint64_t last_ = 0, idle_cost_ = 0;
+  uint32_t n_ = 0, idle_ = 0;
 };
 
 /// 汇总后的快照

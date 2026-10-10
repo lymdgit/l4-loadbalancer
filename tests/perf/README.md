@@ -9,6 +9,7 @@
 | `dr_rs.sh up\|down\|status` | RS | DR 模式下 lo 绑 VIP、关闭 VIP 的 ARP 响应，可还原 |
 | `nic_delta.sh [秒数]` | 任意（DR 时在 RS） | 读 `/proc/net/dev` 算网卡 pps / bps，DR 下用来统计回程 |
 | `lab.sh` | LB 本机 | 单机实验（第 3 节），只用于功能验证 |
+| `memif_bench.sh` | LB 本机 | 单核转发能力：l4lb + 发包器 `tools/memif_gen.c` 通过 net_memif 直连，逐档测 PPS 和忙碌率 |
 
 ## 1. HTTP 压测（wrk / wrk2）
 
@@ -40,7 +41,7 @@ wrk 测的是整条链路（客户端 + LB + RS 协议栈），RS 往往先成�
 - 64B / 512B / 1518B TCP SYN，源 IP/端口随机，目的 VIP:80
 - 逐步提高速率，记录 LB `rx` 与 `fwd_in` 开始出现差距（`tx_full` / 网卡 `imissed` 增长）时的速率
 - 分别用 1 / 2 / 4 / N 个 lcore 测，检查是否近似线性扩展
-- 不装发包工具时，可以用 pipeline 的 `-l 1-2`（只有 1 个转发核）跑 wrk，把转发核压满，得到单核转发 PPS 的近似上限
+- 本机已有方案：`sudo tests/perf/memif_bench.sh`（`WORKERS=2` 测 2 个转发核），用 DPDK `net_memif` 共享内存直连，不需要外部发包机，结果见 `docs/压测方案.md` 第十一节
 
 ## 3. 单机实验（本机同时跑 RS、LB、客户端）
 

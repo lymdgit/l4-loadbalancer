@@ -471,9 +471,9 @@ int worker_loop(void *arg) {
   rte_rcu_qsbr_thread_register(g_dp.qsbr, w.lcore_id);
   rte_rcu_qsbr_thread_online(g_dp.qsbr, w.lcore_id);
 
+  BusyMeter busy;
   while (g_running.load(std::memory_order_relaxed)) {
     const Snapshot &snap = *g_dp.snapshots.current();
-    const uint64_t t0 = rte_rdtsc();
     unsigned work = 0;
 
     // 【热路径】收包 + 处理：rtc 从网卡收，pipeline 从 receiver 的 ring 取
@@ -511,9 +511,7 @@ int worker_loop(void *arg) {
     }
     work += nr;
     tx_flush(w);
-    // 忙碌率：只累计有包处理的轮次（空轮询不算）
-    if (work)
-      w.stats.add_busy(rte_rdtsc() - t0);
+    busy.loop(work != 0, w.stats);
 
     // 本轮处理完毕，不再持有快照、邻居表的引用
     rte_rcu_qsbr_quiescent(g_dp.qsbr, w.lcore_id);
