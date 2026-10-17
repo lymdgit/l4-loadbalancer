@@ -14,7 +14,7 @@ l4lb 也应该提供同样的查询方式：压测前后各读一次计数，自
 |---|---|---|
 | `stats` | 全局累计的 `DPDK RX/TX`（软件计数）、`fwd in/out`、会话数、各类丢包 | 只有包数，没有字节数；没有按服务、按 RS 的拆分 |
 | `stats` 的 NIC 一行 | `rte_eth_stats_get` 的 ipackets、opackets、imissed 等 | 由 master 每秒刷新，最多晚 1 秒；没有字节数 |
-| `rate` | 最近一个 `stats_interval` 周期的 pps 和忙碌率 | 是周期采样，和 wrk 的起止时间对不齐 |
+| `rate` | 最近一个 `stats_interval` 周期的 pps 和忙碌率 | 是周期采样，和压测的起止时间对不齐 |
 | 会话里的 `pkts_in/bytes_in/pkts_out/bytes_out` | 每个会话都在计数 | 没有汇总，会话结束后计数就丢了 |
 
 缺的：
@@ -103,7 +103,7 @@ rs.1.pkts_in 73155
 ...
 ```
 
-- 带时间戳 `time_ns`（CLOCK_REALTIME），两次快照相减就能得到准确的时间间隔，不依赖 wrk 的 `-d` 参数。
+- 带时间戳 `time_ns`（CLOCK_REALTIME），两次快照相减就能得到准确的时间间隔，不依赖压测工具的计时参数。
 - 所有计数单调递增，不提供清零命令，避免多人或多个脚本互相干扰，和 `ipvsadm --zero` 的做法不同。
 
 ### 3. 前后差值工具：`l4lbctl.py delta`
@@ -111,9 +111,9 @@ rs.1.pkts_in 73155
 把"压测前读一次、压测后读一次、相减"做成一条命令：
 
 ```bash
-# 方式 1：压测前后各执行一次
+# 方式 1：压测前后各执行一次（memif_bench.sh 每档就是这么做的）
 scripts/l4lbctl.py counters > /tmp/before.txt
-wrk -t4 -c1000 -d60s http://192.168.154.130/       # 在 client 上执行
+tests/perf/memif_bench.sh                          # 跑一轮压测
 scripts/l4lbctl.py delta /tmp/before.txt           # 再读一次，与 before 相减
 
 # 方式 2：一直等到 Ctrl+C
@@ -144,15 +144,15 @@ rs 2 192.168.154.140:8080   in 57.3k pps   out 57.3k pps   conns 500
 
 `Rate:` 那一行加上 bps，例如 `rx 229.3k pps 150.4 Mbps`，方便在 `tail -f` 里直接看到带宽。
 
-### 5. run_bench.sh
+### 5. memif_bench.sh
 
-每项压测开始前抓一次 `counters`，结束后再抓一次。把差值算出的 PPS 和 bps 写进 `summary.csv`，新增 `lb_pps`、`lb_bps` 两列，这样每个 QPS 数字旁边都有对应的 PPS。
+每一档压测开始前抓一次 `counters`，结束后再抓一次，把差值算出的转发 PPS、bps、各线程忙碌率写进该档的 `delta_<速率>.txt` 和 `summary.txt`，这样每个发包速率旁边都有对应的转发能力数据。
 
 ## 四、性能影响
 
 - 每个转发包多出：全局字节计数 1 次、RS 计数 2 次（pkts 和 bytes），都是本核内存上的普通加法，cache line 只有本核在写。
 - `rx_bytes` 和 `tx_bytes` 每个 burst 累加一次（在 burst 循环里先求和再写）。
-- 预计开销在 1% 以内。实现后用 `lab.sh bench` 和 `perf stat` 对比改动前后，在 `docs/pps方案.md` 里补上实测数据。
+- 预计开销在 1% 以内。实现后用压测对比改动前后的转发能力和忙碌率，见第七节。
 
 ## 五、改动范围
 
@@ -164,7 +164,7 @@ rs 2 192.168.154.140:8080   in 57.3k pps   out 57.3k pps   conns 500
 | `src/dataplane/worker.cpp`、`receiver.cpp` | `rx_bytes`、`tx_bytes`；`counters` 和 `stats -r` 的输出；`Rate:` 行加 bps |
 | `src/ctrl/control.cpp` | 新命令 `counters`、`stats -r`；help |
 | `scripts/l4lbctl.py` | `delta`（读文件或 `--watch`） |
-| `tests/perf/run_bench.sh` | 每项前后抓 `counters`，汇总 PPS |
+| `tests/perf/memif_bench.sh` | 每档前后抓 `counters`，汇总转发 PPS / bps / 忙碌率 |
 | 测试 | 单元测试：差值与格式化；功能测试：发 N 个包后 `counters` 中 fwd、rs 计数和字节数正确，`delta` 输出正确 |
 
 ## 六、待你确认
@@ -185,7 +185,7 @@ scripts/l4lbctl.py delta before.txt              # 压测后
 scripts/l4lbctl.py delta --watch                 # 或者：现在开始，Ctrl+C 结束
 ```
 
-`delta` 输出示例（单机 lab，loadgen 8 秒长连接）：
+`delta` 输出示例（pipeline，2 个 worker）：
 
 ```
 interval 8.06 s  (fullnat, pipeline, 2 workers)
@@ -205,8 +205,8 @@ service 0 web 192.168.154.130:80/tcp   conns 100  in 18.02k pps  out 17.95k pps
 
 比方案多了一行 `busy:`：`counters` 里加了各线程的忙碌时间（`thread.*.busy_ns`）和处理包数，`delta` 据此算出区间内的忙碌率和每包耗时。`ns/pkt` 只计忙碌轮次的时间，包少的时候每批包数小，数字会偏大，只适合在压测时参考。
 
-`run_bench.sh` 设置了 `LB_HOST` 时，每一项测试前后都会在 LB 上执行 `counters` / `delta`，`summary.csv` 和 `mean.csv` 新增 `lb_pps`、`lb_bps` 两列，完整报告保存为 `lb_delta_<测试项>.txt`。
+`memif_bench.sh` 在每一档速率前后都会在 LB 上执行 `counters` / `delta`，该档的完整报告保存为 `delta_<速率>.txt`，汇总表中的 `fwd_in` / `fwd_out` / `busy` / `lb_loss` 都来自这份差值。
 
-开销：单机 lab 用 loadgen 跑了 10 秒、各 2 轮，改动前 19687 / 18753 QPS，改动后 19787 / 18312 QPS，worker 忙碌率都在 23%~28% 之间，差异在测量噪声范围内。这个环境测不出 1% 量级的差别，要在压测环境里用同一套参数再确认。
+开销：早期用单机 HTTP 压测跑了 10 秒、各 2 轮，改动前 19687 / 18753 QPS，改动后 19787 / 18312 QPS，worker 忙碌率都在 23%~28% 之间，差异在测量噪声范围内。这个环境测不出 1% 量级的差别，memif 下的转发能力见 `docs/压测方案.md` 第七节。
 
 测试：新增功能测试 `packet_counters`（20 条连接往返后检查 fwd 包数、字节数、每个 RS 的计数、`stats -r`、`delta` 的报告和 CSV），rtc 和 pipeline 两种模式下全部 24 个功能测试通过，单元测试 8 个通过。

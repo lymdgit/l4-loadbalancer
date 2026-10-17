@@ -55,7 +55,7 @@ trap cleanup EXIT
 
 [ "$(id -u)" = 0 ] || die "run as root"
 [ -x "$ROOT/build/l4lb" ] || die "build l4lb first: ./build.sh"
-# 其他 DPDK 进程（例如正在跑 wrk 的 l4lb -l 1-3）会和这里的 lcore 抢同一个 CPU，
+# 其他 DPDK 进程（例如正在给物理网卡跑的 l4lb -l 1-3）会和这里的 lcore 抢同一个 CPU，
 # 两边都轮询 100%，结果只剩一半左右且丢包严重，memif PMD 还可能在断连时段错误
 if others=$(pgrep -a -x 'l4lb|memif_gen'); then
   die "other DPDK processes are running, stop them first:
@@ -63,7 +63,7 @@ $others"
 fi
 
 # ---- 编译发包器 ----
-GEN=$ROOT/build/lab/memif_gen
+GEN=$ROOT/build/perf/memif_gen
 SRC=$ROOT/tests/perf/tools/memif_gen.c
 if [ ! -x "$GEN" ] || [ "$SRC" -nt "$GEN" ]; then
   if ! pkg-config --exists libdpdk 2>/dev/null; then

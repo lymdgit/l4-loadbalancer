@@ -1,98 +1,91 @@
-# 性能测试
+# 性能测试（memif）
 
-对应《项目重构.md》第四部分。LB、RS、压测客户端要放在不同的机器（至少不同的 VM）上，否则测到的是资源竞争。完整的压测步骤（拓扑、nginx 配置、DR、结果解读）见 `docs/压测方案.md`，最新结果见根目录 README 第六节。
-
-| 脚本 | 在哪台机器运行 | 作用 |
-| :--- | :--- | :--- |
-| `tune.sh <client\|rs\|lb> apply\|show\|revert` | 三台都运行 | 文件句柄、端口范围、TIME_WAIT、conntrack 等调优，可还原 |
-| `run_bench.sh <url> <标签>` | client | wrk / wrk2 的整套测试，设置 `LB_HOST` 时同时记录 LB 的 PPS 和忙碌率 |
-| `dr_rs.sh up\|down\|status` | RS | DR 模式下 lo 绑 VIP、关闭 VIP 的 ARP 响应，可还原 |
-| `nic_delta.sh [秒数]` | 任意（DR 时在 RS） | 读 `/proc/net/dev` 算网卡 pps / bps，DR 下用来统计回程 |
-| `lab.sh` | LB 本机 | 单机实验（第 3 节），只用于功能验证 |
-| `memif_bench.sh` | LB 本机 | 单核转发能力：l4lb + 发包器 `tools/memif_gen.c` 通过 net_memif 直连，逐档测 PPS 和忙碌率 |
-
-## 1. HTTP 压测（wrk / wrk2）
-
-在客户端机器上：
-
-```bash
-# 基线：直连 RS
-THREADS=4 CONNS="100 400 1000" tests/perf/run_bench.sh http://192.168.154.140/ direct
-# 经过 LB（LB 用 config/bench.conf 或 bench_dr.conf 启动）
-THREADS=4 CONNS="100 400 1000" LB_HOST=root@192.168.154.142 \
-  tests/perf/run_bench.sh http://192.168.154.130/ fullnat-pipe-1r2w
-```
-
-覆盖：长连接 QPS（不同并发）、短连接 CPS（`Connection: close`）、固定速率尾延迟（wrk2）。每项默认重复 3 次，`results/<时间>-<标签>/mean.csv` 是均值（含 `avg_lb_pps`、`avg_lb_bps`），`env.txt` 记录环境，`lb_delta_*.txt` 是每项的 LB 计数差值报告。
-
-手动用 wrk 时，在 LB 上前后各执行一次计数：
-
-```bash
-scripts/l4lbctl.py counters > /tmp/before.txt     # 压测前
-scripts/l4lbctl.py delta /tmp/before.txt          # 压测后：PPS、bps、各线程忙碌率、各 RS 分布
-```
-
-短连接测试是验证会话回收的关键：持续 30 秒、每秒数万新建连接时，累计会话数远超会话表容量。压测后在 LB 上执行 `l4lbctl.py stats`，`drop_table_full` 和 `drop_no_port` 应为 0。
-
-## 2. 小包转发能力（TRex / pktgen）
-
-wrk 测的是整条链路（客户端 + LB + RS 协议栈），RS 往往先成为瓶颈。测 LB 本身的 Mpps 需要发包工具，例如 TRex：
-
-- 64B / 512B / 1518B TCP SYN，源 IP/端口随机，目的 VIP:80
-- 逐步提高速率，记录 LB `rx` 与 `fwd_in` 开始出现差距（`tx_full` / 网卡 `imissed` 增长）时的速率
-- 分别用 1 / 2 / 4 / N 个 lcore 测，检查是否近似线性扩展
-- 本机已有方案：`sudo tests/perf/memif_bench.sh`（`WORKERS=2` 测 2 个转发核），用 DPDK `net_memif` 共享内存直连，不需要外部发包机，结果见 `docs/压测方案.md` 第十一节
-
-## 3. 单机实验（本机同时跑 RS、LB、客户端）
-
-```bash
-sudo tests/perf/lab.sh rs-start   # 两个 RS：192.168.154.142:8081 / 8082
-sudo tests/perf/lab.sh lb         # 另一个终端，前台运行 LB
-sudo tests/perf/lab.sh curl       # 看请求被分到 rs=a / rs=b
-sudo tests/perf/lab.sh bench      # 长连接 QPS + 短连接 CPS
-sudo tests/perf/lab.sh rs-stop
-```
-
-工具：`tools/rs_server.c`（响应 body 带 RS 名字）、`tools/loadgen.c`（wrk 不可用时的压测工具）。
-
-### vmxnet3 的 RSS
-
-VMware Workstation 默认不在 vmxnet3 的多个队列间做 RSS 分发，所有包都进队列 0。
-rtc 模式下 `stats` 中 `rss no hash` 持续增长、`redirect out` 约为收包数的 (N-1)/N，
-转发仍然正确（由收包的核转交给会话所在的核），但多核扩展失效。
-这种情况用 pipeline 模式（`dataplane = pipeline`，见 `docs/pipeline改造.md`）。
-想让 RSS 生效，可以关机后在虚拟机的 .vmx 中为 DPDK 使用的网卡加上（X 为网卡序号）：
+只保留一套方案：**用 DPDK `net_memif` 共享内存网卡给 l4lb 直接喂包**，测的是 l4lb 代码本身的转发能力，不经过物理网卡、虚拟交换机（vSwitch）和内核协议栈。
 
 ```
-ethernetX.pnicFeatures = "4"
-ethernetX.udpRSS = "1"
+memif_gen（发包器，lcore 8-10）              l4lb（pipeline，lcore 1 收包 + 2.. 转发）
+  发包核：Client → VIP:9 的 64B UDP ──net_memif──> receiver → worker（FULLNAT 入站）→ 发给 RS
+          10000 条流，按目标速率发送
+  收包核：发给 RS 的包原路回射     <──────────────
+          （交换 MAC/IP/端口，相当于 RS 回包）────> worker（FULLNAT 回程）→ 发给 Client
+          发给 Client 的包计数后丢弃 <──────────────
 ```
 
-## 4. LB 内部观察
+每个 Client 包在 LB 上产生 2 次转发（入站 + 回程），完整走会话查找、FULLNAT 改写、校验和、SNAT 回程路径。
 
-```bash
-scripts/l4lbctl.py rate        # 最近一个周期：pps、bps、各线程忙碌率、网卡丢包
-scripts/l4lbctl.py stats -v    # 累计计数，每个线程一行
-scripts/l4lbctl.py stats -r    # 按服务 / RS 的连接、包、字节
-```
-
-DPDK 是忙轮询，top 看到的 CPU 永远是 100%。判断 LB 负载要看 `rate` / `delta` 中的忙碌率：只统计处理到包的轮次花掉的 TSC 周期。命令的完整说明见 `docs/控制命令.md`。
-
-需要关注：
-
-| 计数 | 含义 |
+| 文件 | 作用 |
 | :--- | :--- |
-| `Busy:` 忙碌率 | 接近 100% 说明这个线程到顶了；远低于 100% 而 QPS 上不去，说明瓶颈在 LB 之外 |
-| `imissed` | 网卡 RX 队列满丢弃，收包跟不上 |
-| `rx_ring_full` | pipeline 下转发核的 ring 满，转发核处理不过来 |
-| `redirect_out` | 收包的核不是会话 owner、转交给其他核的包数。pipeline 下和硬件 RSS 生效时（`steering: hw-rss`）应接近 0 |
-| `rss_mismatch` | 网卡 RSS hash 与软件计算不一致的 SYN 数，应为 0 |
-| `rss_no_hash` | 硬件 RSS 模式下网卡没有给出 hash 的 SYN 数，应为 0；不为 0 说明 RSS 实际没有生效 |
-| `drop_*` | 各类丢包原因 |
-| `tx_full` | TX 队列满，说明发送跟不上 |
+| `memif_bench.sh` | 一键测试：编译发包器、启动 l4lb（memif server）、逐档调速率、用 `counters` / `delta` 收集每档数据 |
+| `tools/memif_gen.c` | 发包器（memif client）：按速率发包、回射模拟 RS、输出机器可读结果 |
+| `results/` | 每次运行的原始数据，`<时间>-memif/` |
 
-配合 `perf top` / 火焰图定位热点（CMake 默认 `RelWithDebInfo` 并保留帧指针）。
+## 1. 运行
 
-## 5. 记录规范
+```bash
+./build.sh                                   # 先编译 l4lb
+sudo tests/perf/memif_bench.sh               # 1 个转发核，按默认速率逐档测
+sudo WORKERS=2 tests/perf/memif_bench.sh     # 2 个转发核
+sudo RATES="2000000 3000000" DURATION=20 tests/perf/memif_bench.sh
+```
 
-每次测试记录：CPU 型号和频率、核数、NUMA、网卡型号和驱动、DPDK 版本、l4lb 的 git commit 和编译参数、vCPU 是否绑核、宿主机负载。每个重构阶段结束后用同一套脚本回归，结果存档对比。
+可调环境变量：
+
+| 变量 | 默认 | 说明 |
+| :--- | :--- | :--- |
+| `WORKERS` | `1` | 转发核数（pipeline 模式下另加 1 个收包核） |
+| `LB_LCORES` | `1-$(1+WORKERS)` | l4lb 使用的 lcore |
+| `GEN_LCORES` | `8-10` | 发包器的 lcore（main + 发包核 + 收包核） |
+| `RATES` | `500000 1000000 2000000 3000000 0` | 发包速率（pps），`0` 表示尽力发送，每档单独一轮 |
+| `DURATION` | `10` | 每档持续秒数 |
+| `FLOWS` | `10000` | 并发流（会话）数 |
+| `SIZE` | `60` | 帧长（不含 FCS，60 即 64 字节小包） |
+| `REFLECT` | `1` | `1` 回射（入站 + 回程）；`0` 只测入站 |
+
+要求：
+
+- root 权限，已配置大页；运行前停掉其它 l4lb / memif_gen（会抢 lcore，结果只剩一半且丢包严重）。
+- 脚本用 `--no-pci` 启动，不碰物理网卡；控制 socket 走独立临时路径，不影响正在跑的 l4lb。
+- 两端队列数自动对齐：l4lb TX = worker 数 + 1，RX 向上取 2 的幂；发包器 RX/TX 与之相反。手动跑 `memif_gen` 时必须自己保证 `--rxq` / `--txq` 一致，否则数据会悄悄出错。
+
+## 2. 结果怎么看
+
+每次运行产生 `tests/perf/results/<时间>-memif/`：
+
+| 文件 | 内容 |
+| :--- | :--- |
+| `summary.txt` | 汇总表（每次运行追加一行） |
+| `delta_<速率>.txt` | 该档的 l4lb 计数报告（`counters` / `delta` 差值） |
+| `gen_<速率>.txt` | 发包器原始输出（`tx_pps`、`client_pps`、往返成功数等） |
+
+`summary.txt` 的列：
+
+| 列 | 含义 |
+| :--- | :--- |
+| `target` | 目标速率（`max` 表示尽力发送） |
+| `gen_tx` | 发包器实际发送 pps |
+| `gen_back` | 完成一次完整往返（Client → LB → RS → LB → Client）的 pps |
+| `fwd_in` / `fwd_out` / `fwd_total` | l4lb 入站 / 回程 / 总转发 pps |
+| `rcv_busy` / `wk_busy` | 收包核 / 转发核忙碌率 |
+| `lb_loss` | l4lb 丢包率（`drops ÷ (处理的包 + drops)`，含 `rx_ring_full`、`tx_full`） |
+
+## 3. 判据
+
+1. **计数必须互相对得上**：`gen_tx ≥ fwd_in ≥ fwd_out = gen_back`。对不上说明测试环境本身有问题（会话串了、包在环、队列数不匹配），该轮数据作废。
+2. **按丢包率取能力值**：取 `lb_loss < 0.1%` 时的最大转发速率（RFC 2544 的思路），这比"尽力发送"的数字更能代表可用能力。
+3. **加 worker 看是否近似线性**：同时观察 `wk_busy`，如果转发核没满（< 85%）而转发量不再上涨，瓶颈在发包器，不在 l4lb。
+
+## 4. 注意
+
+- 数据**不含真实网卡的收发开销**，不能与物理网卡上的结果或 DPVS / Katran 的公开数据直接对比。
+- memif 默认是 copy 模式（两端用不同 `--file-prefix`），每包多一次内存拷贝，不影响横向对比。
+- `FLOWS` 条会话在测试开始时建立，之后都是已有会话的转发，测的是转发路径，不是新建连接速度。
+- 看单核热点，压测时另开终端：
+
+```bash
+perf record -F 2999 -C 2 -- sleep 5
+perf report --no-children --sort symbol
+```
+
+这台 VM 不支持硬件计数器（`perf stat` 的 cycles 显示 not supported），只能采样。
+
+完整方案、实测结果和排查记录见 `docs/压测方案.md`、`docs/PPS测试与性能排查.md`。

@@ -21,7 +21,7 @@
 ```text
 CMakeLists.txt
 build.sh           一键编译（./build.sh help）
-config/            lb.conf（FULLNAT）、lb_dr.conf（DR）、bench.conf / bench_dr.conf（压测）
+config/            lb.conf（FULLNAT）、lb_dr.conf（DR）
 scripts/           setup_dpdk_env.sh（大页/驱动/网卡接管）、l4lbctl.py（控制命令）
 include/ src/      一一对应：
   common/          配置、日志、统计、公共类型
@@ -34,7 +34,7 @@ include/ src/      一一对应：
   core/            报文分类与处理主流程
 tests/unit/        单元测试（ctest）
 tests/functional/  功能测试（veth + net_af_packet，无需真实网卡）
-tests/perf/        压测脚本：run_bench.sh（wrk）、tune.sh（系统调优）、dr_rs.sh（DR 的 RS 配置）
+tests/perf/        压测：memif_bench.sh + tools/memif_gen.c（net_memif 单机压测）
 docs/              设计文档：pipeline改造、控制命令、压测方案、pps方案、日志改造方案等
 项目重构.md         重构计划与完成情况
 ```
@@ -105,16 +105,13 @@ pipeline 模式需要至少 2 个 lcore；两种模式下网卡 TX 队列数都�
 DR 只改写目的 MAC，RS 直接回包。RS 的 lo 上要配 VIP，并且不能应答 VIP 的 ARP（先改 sysctl，再加 VIP）：
 
 ```bash
-sudo tests/perf/dr_rs.sh up       # 还原：dr_rs.sh down
-```
-
-等价于：
-
-```bash
 sudo sysctl -w net.ipv4.conf.all.arp_ignore=1 net.ipv4.conf.all.arp_announce=2
 sudo sysctl -w net.ipv4.conf.lo.arp_ignore=1 net.ipv4.conf.lo.arp_announce=2
 sudo ip addr add <VIP>/32 dev lo
+# 还原：sysctl -w ...=0，ip addr del <VIP>/32 dev lo
 ```
+
+这些是运行时设置，RS 重启后自动失效。
 
 DR 不改端口，RS 端口必须与 VIP 端口相同。
 
@@ -152,10 +149,10 @@ grep -E 'Rate:|Busy:|NIC:' /data/logs/l4/l4lb.log   # 每 stats_interval 秒的�
 ctest --test-dir build                                    # 单元测试
 sudo python3 tests/functional/run_tests.py build/l4lb     # 功能测试（需要 root 和大页）
 sudo L4T_DATAPLANE=pipeline python3 tests/functional/run_tests.py build/l4lb   # 用 pipeline 模式跑全部功能测试
-tests/perf/run_bench.sh http://<VIP>/ <标签>               # 性能测试（在客户端机器上）
+sudo WORKERS=1 tests/perf/memif_bench.sh                   # 性能测试（memif，LB 本机）
 ```
 
-功能测试在 veth 上用 `net_af_packet` 运行 l4lb，覆盖 FULLNAT/DR 转发、畸形包、会话回收、TCP 状态机、LIP、TOA、ICMP 差错、ARP/网关、健康检查、控制命令、多核、pipeline 分发、包/字节计数、日志文件。压测步骤见 `docs/压测方案.md`。
+功能测试在 veth 上用 `net_af_packet` 运行 l4lb，覆盖 FULLNAT/DR 转发、畸形包、会话回收、TCP 状态机、LIP、TOA、ICMP 差错、ARP/网关、健康检查、控制命令、多核、pipeline 分发、包/字节计数、日志文件。性能测试用 DPDK `net_memif` 给 l4lb 直接喂包，步骤和结果解读见 `docs/压测方案.md`、`tests/perf/README.md`。
 
 ## 六、性能数据
 
@@ -163,36 +160,22 @@ tests/perf/run_bench.sh http://<VIP>/ <标签>               # 性能测试（�
 
 | | |
 | :--- | :--- |
-| 宿主机 | i7-13650HX 笔记本，VMware Workstation，所有 VM 在同一个 vmnet |
-| LB | vmxnet3（DPDK 24.11，uio_pci_generic），**pipeline：1 个收包核 + 2 个转发核**（`-l 1-3`） |
-| 后端 | 1 台 nginx VM，80 / 8080 两个端口模拟两个 RS（DR 下只用 80） |
-| 客户端 | 4 vCPU VM，`wrk -t4 -c1000 -d60s`，HTTP 长连接 |
+| 宿主机 | i7-13650HX 笔记本，VMware Workstation，12 vCPU VM |
+| 被测 | l4lb，**pipeline：1 个收包核 + N 个转发核**（DPDK 24.11） |
+| 流量 | DPDK `net_memif` 共享内存直连，64B UDP（+FCS），10000 条会话，每包走完整 FULLNAT 入站 + 回程 |
 
-vmxnet3 在 VMware Workstation 下不做 RSS（所有包进同一个队列），所以使用 pipeline 模式。
+用 memif 而不是真实网卡，是因为 vmxnet3 和宿主机的虚拟交换机在几十万 pps 就到顶了，压不满 LB；memif 绕开这两层，测到的才是 l4lb 代码本身的处理能力。
 
 ### 结果（2026-10-09）
 
-| 场景 | QPS | p50 | p99 | LB 转发 PPS | 收包核忙碌率 | 转发核忙碌率 | 丢包 |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: | :---: |
-| 直连 nginx（基线） | 161,674 | 5.18 ms | 89.50 ms | – | – | – | – |
-| FULLNAT | 126,145（78%） | 6.95 ms | 48.88 ms | 223.9k（双向） | 26.5% | 67.3% / 67.4% | 0 |
-| DR | 133,090（82%） | 6.72 ms | 36.74 ms | 121.1k（只有入向） | 14.7% | 32.9% / 33.3% | 0 |
-
-- PPS 和忙碌率来自压测前后 `l4lbctl.py counters` / `delta` 的差值
-- FULLNAT 每个请求的去程和回程都经过 LB，PPS ≈ 2 × QPS；DR 的回包由 RS 直接发给客户端，LB 只处理入向，PPS ≈ QPS。两种模式的 PPS 口径不同，不能直接比较大小；可比较的是同等流量下的 LB 负载：DR 比 FULLNAT 低约一半。
-- 瓶颈不在 LB：转发核负载 67%、网卡无丢包，而直连 nginx 本身只有 16 万 QPS。FULLNAT 比直连每个请求多经过两次虚拟交换机，DR 多一次，这部分开销由宿主机 CPU 承担，是 QPS 差距的主要来源。
-- 虚拟化环境下每包耗时偏高（转发核约 6 µs/包），推测主要来自 vmxnet3 的虚拟化开销（如 TX doorbell 引起的 VM exit）和小批量收包，尚未用 perf 确认。数据只代表这个环境，不能与物理网卡上的 Mpps 级结果对比。
-
-复现：`docs/压测方案.md`（拓扑、nginx 配置、`tests/perf/tune.sh` 调优、DR 步骤）。
-
-### 单核转发能力（memif，排除网卡和虚拟化开销）
-
-端到端测试中 LB 没有被压满。为了测 l4lb 本身的上限，用 DPDK `net_memif`（共享内存虚拟网卡）在本机直接给 l4lb 喂 64 字节 UDP 包，发包器把发给 RS 的包原路回射，每个包走完整的 FULLNAT 入站 + 回程（`tests/perf/memif_bench.sh`）：
-
-| 转发核 | LB 转发 PPS（丢包率 < 0.1%） | 饱和时 | 
+| 转发核 | LB 转发 PPS（丢包率 < 0.1%） | 饱和时 |
 | :--- | ---: | :--- |
 | 1 | **400 万** | 约 670 万，转发核 94% |
 | 2 | **600 万** | 尽力发送 950 万（丢包 0.8%），转发核 81%，受限于发包器 |
 
-单核热点是会话表查找（`rte_hash_lookup_data` 约 53%）。这组数据不含真实网卡的收发开销，和上面的端到端结果分开看。详见 `docs/压测方案.md` 第十一节，排查过程见 `docs/PPS测试与性能排查.md`。
+- 单核每包约 150 ns，热点是会话表查找（`rte_hash_lookup_data` 约 53%）；2 核时转发核还没满，瓶颈在发包器（单核约 480 万/秒）。
+- 判据是"丢包率低于 0.1% 时的最大转发速率"，同时要求 `发包数 ≥ 入站转发 ≥ 回程转发 = 往返成功` 互相对得上。
+- 这组数据**不含真实网卡的收发开销**，不能与物理网卡上的端到端 Mpps 或 DPVS、Katran 的公开数据直接对比。
+
+复现：`sudo WORKERS=2 tests/perf/memif_bench.sh`。完整方案见 `docs/压测方案.md`，排查过程见 `docs/PPS测试与性能排查.md`。
 

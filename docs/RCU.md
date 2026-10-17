@@ -460,6 +460,6 @@ while (1) {
 > EPOLLET 性能更好但容错率为零，任何遗漏都会导致连接僵死。
 >
 > **最终实现**：`RS_Src/epoll_server/simple_server_mt.c` 最后改成了 LT 模式 + 单次 `recv`（没读完的数据 epoll 会再次通知），
-> 并按 `\r\n\r\n` 统计一次读到的管线化请求数，逐个回复，避免 wrk keep-alive 管线化时请求和响应错位。
-> 压测现在用 nginx 作为后端（`docs/压测方案.md`），这个测试服务器只用于功能验证。
+> 并按 `\r\n\r\n` 统计一次读到的管线化请求数，逐个回复，避免 keep-alive 管线化时请求和响应错位。
+> 这是历史记录：HTTP 压测后端已经不再使用（性能测试改为 `docs/压测方案.md` 的 memif 方案），这段脚本只作为 EPOLLET 调试经验保留。
 

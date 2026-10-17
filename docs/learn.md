@@ -21,15 +21,14 @@
 
 ### 性能表现
 
-VMware Workstation，vmxnet3，pipeline 1 个收包核 + 2 个转发核，后端 1 台 nginx，`wrk -t4 -c1000 -d60s`：
+VMware Workstation，pipeline 1 个收包核 + N 个转发核，用 DPDK `net_memif` 共享内存网卡在本机喂 64 字节 UDP 包（每包走完整入站 + 回程）：
 
-| 场景 | QPS | LB 转发 PPS | 转发核负载 |
-|---------|-----|------|------|
-| 直连 nginx | 161,674 | – | – |
-| FULLNAT | 126,145（78%） | 22.4 万（双向） | 67% |
-| DR | 133,090（82%） | 12.1 万（只有入向） | 33% |
+| 转发核 | LB 转发 PPS（丢包率 < 0.1%） | 饱和时 |
+|---------|-----|------|
+| 1 | **400 万** | 约 670 万，转发核 94% |
+| 2 | **600 万** | 尽力发送 950 万，转发核 81%，受限于发包器 |
 
-瓶颈在虚拟交换机和后端，LB 自身还有余量。说明和复现方法见 README 第六节、`docs/压测方案.md`。
+每包约 150 ns，热点是会话表查找。数据不含真实网卡收发开销。说明和复现方法见 README 第六节、`docs/压测方案.md`。
 
 ## 架构介绍
 
@@ -38,7 +37,7 @@ VMware Workstation，vmxnet3，pipeline 1 个收包核 + 2 个转发核，后端
 ```
 l4-loadbalancer/
 ├── CMakeLists.txt / build.sh   # 构建（./build.sh 一键编译）
-├── config/                     # lb.conf（FULLNAT）、lb_dr.conf（DR）、bench*.conf（压测）
+├── config/                     # lb.conf（FULLNAT）、lb_dr.conf（DR）
 ├── include/ src/               # 一一对应
 │   ├── common/                 # 配置、日志（异步）、统计计数器、公共类型
 │   ├── protocol/               # 以太网/IP/TCP/UDP 头、解析器、校验和、ARP/ICMP
@@ -52,7 +51,7 @@ l4-loadbalancer/
 ├── scripts/                    # setup_dpdk_env.sh（网卡接管）、l4lbctl.py（控制命令）
 ├── tests/unit/                 # 单元测试（ctest）
 ├── tests/functional/           # 功能测试（veth + net_af_packet，不需要真实网卡）
-├── tests/perf/                 # 压测脚本
+├── tests/perf/                 # memif 压测（memif_bench.sh + memif_gen.c）
 └── docs/                       # 设计文档、学习笔记
 ```
 
@@ -238,12 +237,14 @@ sudo L4T_DATAPLANE=pipeline python3 tests/functional/run_tests.py build/l4lb   #
 
 ### 性能测试
 
-客户端、LB、RS 分别放在不同的 VM 上，步骤见 `docs/压测方案.md`：
+用 DPDK `net_memif` 让发包器和 l4lb 在同一台机器上通过共享内存直连，绕开网卡和虚拟交换机，步骤见 `docs/压测方案.md`：
 
 ```bash
-wrk -t4 -c1000 -d60s --latency http://192.168.154.130/     # 在 client 上
-scripts/l4lbctl.py counters > /tmp/before.txt              # 在 LB 上，压测前
-scripts/l4lbctl.py delta /tmp/before.txt                   # 在 LB 上，压测后：PPS、忙碌率
+sudo tests/perf/memif_bench.sh                             # 1 个转发核
+sudo WORKERS=2 tests/perf/memif_bench.sh                   # 2 个转发核
+# 手工看区间数据：
+scripts/l4lbctl.py counters > /tmp/before.txt              # 压测前
+scripts/l4lbctl.py delta /tmp/before.txt                   # 压测后：PPS、bps、忙碌率
 ```
 
 ### 抓包调试
@@ -272,7 +273,9 @@ sudo tcpdump -i ens33 -n -e -v tcp port 80
 RS 没有配置 VIP，或者 RS 应答了 VIP 的 ARP：
 
 ```bash
-sudo tests/perf/dr_rs.sh up      # 在 RS 上：先改 arp_ignore/arp_announce，再在 lo 上加 VIP
+sudo sysctl -w net.ipv4.conf.all.arp_ignore=1 net.ipv4.conf.all.arp_announce=2   # 在 RS 上
+sudo sysctl -w net.ipv4.conf.lo.arp_ignore=1 net.ipv4.conf.lo.arp_announce=2
+sudo ip addr add 192.168.154.130/32 dev lo                # 再加 VIP
 ip neigh flush 192.168.154.130   # 在 client 上清掉 VIP 的旧 ARP 缓存
 ```
 
@@ -639,7 +642,7 @@ ip neigh flush 192.168.154.130   # 在 client 上清掉 VIP 的旧 ARP 缓存
 
 ## DR模式下数据流向
 
-见 `docs/架构图.md` 第五节和 `docs/压测方案.md` 第十节：LB 只把目的 MAC 改成 RS 的 MAC，RS 的 lo 上有 VIP 所以会接收，回包源地址是 VIP，直接发给客户端。
+见 `docs/架构图.md` 第五节：LB 只把目的 MAC 改成 RS 的 MAC，RS 的 lo 上有 VIP 所以会接收，回包源地址是 VIP，直接发给客户端。
 
 ## DPDK的常用的数据结构
 

@@ -78,7 +78,7 @@ master 线程（普通线程，不占 lcore）：健康检查、ARP、免费 ARP
 dataplane = pipeline
 ```
 
-- 代码里默认是 `rtc`，保持现有行为，也方便以后上了支持 RSS 的网卡做对比。`config/lb.conf`、`tests/perf/lab.conf` 改成写 `pipeline`。
+- 代码里默认是 `rtc`，保持现有行为，也方便以后上了支持 RSS 的网卡做对比。`config/lb.conf` 改成写 `pipeline`。
 - pipeline 模式下，EAL 的 main lcore 是 receiver，其余 lcore 依次是 worker 0、1、……。`-l 1-3` 就表示 lcore 1 做 receiver，lcore 2、3 做 worker 0、1。master 线程和控制线程不占用 `-l` 里的核（见第 5 节）。
 - 至少需要 2 个 lcore（1 个 receiver 加 1 个 worker），否则启动报错。
 - 设计上支持任意多个 worker，"1 + 2" 只是这次推荐的用法。
@@ -169,7 +169,7 @@ master 线程每毫秒最多被延迟一点，影响的是 ARP 学习和健康�
 | `src/ctrl/control.cpp` | 控制线程改用 `rte_thread_create_control` 创建 |
 | `include/common/stats.h` | 新增 `drop_rx_ring`、`ring_in` 计数器 |
 | `src/main.cpp` | 按模式分配 lcore、配置队列、创建 ring、启动 receiver 和 master 线程、退出清理 |
-| `config/lb.conf`、`tests/perf/lab.conf`、`tests/perf/lab.sh` | 改为 `dataplane = pipeline`，`LB_CORES` 默认改成 `1-3` |
+| `config/lb.conf` | 改为 `dataplane = pipeline`，默认 `-l 1-3` |
 | `tests/` | 见下节 |
 
 `processor.cpp`、会话表、调度、健康检查逻辑都不改（健康检查只是换到 master 线程上调用）。
@@ -183,7 +183,7 @@ master 线程每毫秒最多被延迟一点，影响的是 ARP 学习和健康�
   - 健康检查、控制面命令（验证 master 线程能正常发包、收事件）
   - 只给 1 个 lcore 时拒绝启动
   - 原有的 rtc 用例全部保持通过（harness 的默认 `qpairs` 改成 lcore 数 + 1，给 master 线程留一个 TX 队列）
-- **实机**（ens160 / vmxnet3）：`lab.sh lb` 加 `lab.sh bench`。观察 receiver 和两个 worker 的 CPU 占用（`perf top -C <lcore>`）、`stats -v`，确认两个 worker 的负载大致相当、`drop_rx_ring` 为 0，master 线程不在 `-l` 的核上。
+- **实机**（ens160 / vmxnet3）：启动 l4lb 后用 HTTP 压测打流量（当时的单机 lab 脚本已删除）。观察 receiver 和两个 worker 的 CPU 占用（`perf top -C <lcore>`）、`stats -v`，确认两个 worker 的负载大致相当、`drop_rx_ring` 为 0，master 线程不在 `-l` 的核上。现在验证转发能力统一用 `memif_bench.sh`。
 
 ## 五、取舍
 
@@ -196,4 +196,4 @@ master 线程每毫秒最多被延迟一点，影响的是 ARP 学习和健康�
 
 - 单元测试 8 个全过（新增 `tests/unit/test_dispatch.cpp`）；功能测试 23 个在 rtc 和 pipeline 两种模式下都通过（`L4T_DATAPLANE=pipeline run_tests.py ...` 用 pipeline 跑全部用例）。
 - ens160（vmxnet3）`-l 1-3`：4 RX / 3 TX 队列；receiver 在 lcore 1，worker 在 lcore 2/3，`l4lb-master`、`l4lb-ctl` 线程落在 `-l` 之外的 CPU。
-- `lab.sh bench`（5 秒）：keep-alive 13901 QPS、短连接 2396 CPS，0 错误；两个 worker 的 ring_in 为 138329 / 152604，`redirect_out` 0，`rx_ring_full` 0，Dropped 0。这个数字受本机 loadgen 和 RS 共用 CPU、vmxnet3 的限制，只用作和后续改动对比的基线。
+- 早期单机实验（5 秒，脚本已随端到端方案一起删除）：keep-alive 13901 QPS、短连接 2396 CPS，0 错误；两个 worker 的 ring_in 为 138329 / 152604，`redirect_out` 0，`rx_ring_full` 0，Dropped 0。这个数字受本机压测端和 RS 共用 CPU、vmxnet3 的限制，只用作当时改动前后的对比基线。
