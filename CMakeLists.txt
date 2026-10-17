@@ -14,6 +14,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(L4LB_NATIVE    "Optimize for the build machine (-march=native)" ON)
+option(L4LB_LTO       "Link-time optimization (OFF: perf 火焰图/gdb 分析用)" ON)
 option(L4LB_SANITIZE  "Build with AddressSanitizer + UBSan (Debug use)" OFF)
 option(L4LB_HW_CKSUM  "Use NIC TX checksum offload when available" ON)
 option(BUILD_TESTS    "Build unit tests (ctest)" ON)
@@ -63,8 +64,9 @@ target_link_libraries(l4lb_core PUBLIC PkgConfig::DPDK Threads::Threads)
 add_executable(l4lb src/main.cpp)
 target_link_libraries(l4lb PRIVATE l4lb_core)
 
-if(L4LB_IPO_OK AND NOT L4LB_SANITIZE)
+if(L4LB_IPO_OK AND NOT L4LB_SANITIZE AND L4LB_LTO)
     # 拆分为多个 .cpp 后，开启 LTO 让编译器仍能跨文件内联热路径函数
+    # （build.sh -d 或 -DL4LB_LTO=OFF 可关闭，perf 火焰图/gdb 分析时符号更完整）
     set_property(TARGET l4lb_core l4lb PROPERTY INTERPROCEDURAL_OPTIMIZATION ON)
 endif()
 

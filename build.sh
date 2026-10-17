@@ -7,6 +7,7 @@
 #   ./build.sh clean         # 删除 build 目录后重新编译
 #   ./build.sh asan          # ASan + UBSan 版本，输出到 build-asan/
 #   ./build.sh debug         # Debug 版本，输出到 build-debug/
+#   ./build.sh -d            # 无 LTO 版本（perf 火焰图/gdb 分析用），输出到 build-nolto/
 #   ./build.sh help
 #
 # 可以组合：./build.sh clean test
@@ -72,6 +73,7 @@ for arg in "$@"; do
   test)  DO_TEST=1 ;;
   asan)  BUILD_DIR="$ROOT/build-asan"; EXTRA+=(-DL4LB_SANITIZE=ON) ;;
   debug) BUILD_DIR="$ROOT/build-debug"; BUILD_TYPE=Debug ;;
+  -d|--no-lto) BUILD_DIR="$ROOT/build-nolto"; EXTRA+=(-DL4LB_LTO=OFF) ;;
   help|-h|--help) usage ;;
   *) echo "[build] unknown argument: $arg" >&2; usage 1 ;;
   esac
